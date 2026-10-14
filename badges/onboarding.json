@@ -1,12 +1,12 @@
 {
   "schemaVersion": 1,
   "label": "onboarding",
-  "message": "setup 62/wk · MCP 4.4k/day",
+  "message": "setup 62/wk · MCP 0.0k/day",
   "color": "blue",
-  "generated_at": "2026-10-14T00:23:37Z",
+  "generated_at": "2026-10-14T00:34:21Z",
   "window": {
     "downloads": "last-week",
-    "activity": "2026-10-13",
+    "activity": "2026-10-14",
     "traffic": "14d"
   },
   "downloads": {
@@ -14,16 +14,16 @@
     "misakanet-setup": 62
   },
   "activity": {
-    "date": "2026-10-13",
-    "total": 4702,
+    "date": "2026-10-14",
+    "total": 37,
     "calls": {
-      "agent": 78,
-      "crawler": 133,
-      "mcp": 4397,
-      "pageview": 94
+      "agent": 2,
+      "crawler": 0,
+      "mcp": 34,
+      "pageview": 1
     }
   },
   "traffic": null,
-  "mcp_per_weekly_install": 496.4,
+  "mcp_per_weekly_install": 3.8,
   "mcp_per_weekly_install_note": "proxy, not a conversion rate: npx caching depresses the denominator and one agent makes many calls. Read it as a trend, never as a score."
 }
