@@ -39,14 +39,24 @@ VERIFY_HEADINGS = re.compile(
 
 
 def extract_frontmatter(path: Path) -> dict | None:
-    content = path.read_text(encoding="utf-8")
-    m = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(1))
-    except json.JSONDecodeError:
-        return None
+    """Frontmatter as a dict — JSON (legacy) or YAML, which is what the corpus actually writes.
+
+    This used to match the ``---`` fence and then hand the inside to ``json.loads``. Every lesson
+    in this repository writes **YAML** frontmatter (measured 2026-10-14: 516 of 519 files; the 3
+    that parse are the JSON ones), so ``json.loads`` raised on every one of them and the function
+    returned ``None`` — silently, via the ``except``. The visible consequence was that a
+    regeneration labelled **413 of 415** tasks ``domain: "general"`` no matter what the lesson's
+    frontmatter said, and collapsed a 9-domain working set to 3.
+
+    Delegated to ``scripts/lesson_gate.parse_frontmatter``, which already handles both shapes
+    (and the JSON+provenance legacy quirk) and returns the ``(dict, body)`` pair this needs.
+    """
+    if str(REPO_ROOT) not in sys.path:      # runnable as `python3 scripts/extract_tasks.py` too
+        sys.path.insert(0, str(REPO_ROOT))
+    from scripts.lesson_gate import parse_frontmatter  # local import: repo path
+
+    fm, _ = parse_frontmatter(path.read_text(encoding="utf-8"))
+    return fm or None
 
 
 def extract_section(body: str, heading_pattern: re.Pattern, keep_code: bool = False) -> str | None:
