@@ -109,3 +109,55 @@ def test_the_extraction_uses_real_domains_across_the_corpus(et):
         f"only {len(domains)} distinct domains across the corpus: {sorted(domains)}. With the "
         "json.loads parser this collapses to 1 ('general')."
     )
+
+# ── duplicate task_id ───────────────────────────────────────────────────────────────
+# The second half of the regeneration question. `task_id` is derived from the filename stem
+# alone, so `lessons/en/<stem>.md` and `lessons/contrib/<stem>.md` both want
+# `lesson-<stem>`. The writer keys on `task_id`, so it silently overwrote the earlier lesson —
+# 26 of them, measured 2026-10-14 — and said nothing, because "one file wrote successfully" is
+# exactly what the code checked.
+#
+# The data model (is an `en/` lesson a translation, or its own lesson?) is not answerable here:
+# only 22 of 64 `lessons/en/` files declare `translated_from`, and 7 of the 26 colliding ones
+# declare nothing. So this does not decide it. It refuses to write until it is decided, which is
+# the part that is a defect today.
+
+
+def test_duplicate_task_ids_are_reported_not_silently_overwritten(et):
+    claims = et.duplicate_task_ids([
+        {"task_id": "lesson-x", "source": "lessons/core/x.md"},
+        {"task_id": "lesson-x", "source": "lessons/en/x.md"},
+        {"task_id": "lesson-y", "source": "lessons/core/y.md"},
+    ])
+    assert claims == [("lesson-x", ["lessons/core/x.md", "lessons/en/x.md"])], claims
+
+
+def test_no_duplicate_task_ids_are_reported(et):
+    """The predicate must not fire on a clean list, or the refusal would be noise."""
+    assert et.duplicate_task_ids([
+        {"task_id": "lesson-a", "source": "lessons/core/a.md"},
+        {"task_id": "lesson-b", "source": "lessons/en/b.md"},
+    ]) == []
+
+
+def test_the_real_corpus_does_collide_and_the_check_can_see_it(et):
+    """Pins that the collision is real, so the refusal is not guarding a hypothetical.
+
+    The exact count is deliberately not asserted — the corpus will be fixed and this should keep
+    passing afterwards. What must not regress is that `duplicate_task_ids` returns [] on a
+    collision-free corpus and non-empty here, i.e. that it is actually looking.
+    """
+    tasks = []
+    for path in sorted(et.LESSONS_DIR.rglob("*.md")):
+        if path.name in ("index.md", "README.md") or "_archive" in str(path):
+            continue
+        task = et.lesson_to_task(path)
+        if task:
+            tasks.append(task)
+    collisions = et.duplicate_task_ids(tasks)
+    for tid, sources in collisions:
+        assert len(sources) > 1
+        assert all(s.startswith("lessons/") for s in sources)
+    # Every collision is an en/ lesson against an original — that is the shape worth reporting.
+    for _tid, sources in collisions:
+        assert any(s.startswith("lessons/en/") for s in sources), sources

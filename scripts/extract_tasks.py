@@ -144,6 +144,25 @@ def lesson_to_task(path: Path) -> dict | None:
     }
 
 
+def duplicate_task_ids(tasks: list[dict]) -> list[tuple[str, list[str]]]:
+    """`task_id` values claimed by more than one lesson, with the sources that claim them.
+
+    `task_id` is derived from the filename stem alone (`lesson-<stem>`), so two lessons with the
+    same stem in different subdirectories collide. Measured 2026-10-14 on this corpus: **26**
+    collisions, every one of them a `lessons/en/<stem>.md` against a `lessons/core/` or
+    `lessons/contrib/` lesson of the same stem.
+
+    The corpus has no single rule for whether an `en/` lesson is a translation of the original or
+    a lesson in its own right: only **22 of 64** `lessons/en/` files declare `translated_from`
+    (and all 22 of those targets exist), while 7 of the 26 colliding `en/` files declare
+    nothing. So this reports rather than guesses — see the refusal in `main()`.
+    """
+    claims: dict[str, list[str]] = {}
+    for task in tasks:
+        claims.setdefault(task["task_id"], []).append(task["source"])
+    return [(tid, srcs) for tid, srcs in claims.items() if len(srcs) > 1]
+
+
 def main():
     paths = sorted(LESSONS_DIR.rglob("*.md"))
 
@@ -165,12 +184,39 @@ def main():
             if DRY_RUN:
                 print(f"  ✅ {task['task_id']} — {task['domain']}")
 
+    collisions = duplicate_task_ids(tasks)
     if DRY_RUN:
         print(f"\n{'='*40}")
         print(f"Total lessons: {total}")
         print(f"Extractable:   {extracted}")
         print(f"Skip rate:     {total - extracted}/{total}")
+        if collisions:
+            print(f"\n{'='*40}")
+            print(f"⚠️  {len(collisions)} task_id collision(s) — a write would DROP the earlier "
+                  f"lesson(s) silently:")
+            for tid, sources in collisions:
+                print(f"   {tid}")
+                for s in sources:
+                    print(f"       <- {s}")
+            print("\nResolve these before regenerating: the corpus has no single rule for whether "
+                  "an `lessons/en/` file is a translation of an existing lesson or its own. "
+                  "Only 22 of 64 declare `translated_from`, so this cannot be inferred.")
         return
+
+    # Refuse to write. The writer below would otherwise overwrite `tasks/<tid>.json` for every
+    # collision and lose the earlier lesson without a word — measured 2026-10-14: 26 of them.
+    if collisions:
+        print("", file=sys.stderr)
+        print(f"refusing to write: {len(collisions)} duplicate task_id(s). The writer keys on "
+              f"task_id, so each collision silently overwrites the previous lesson.", file=sys.stderr)
+        for tid, sources in collisions:
+            print(f"  {tid}", file=sys.stderr)
+            for s in sources:
+                print(f"      <- {s}", file=sys.stderr)
+        print("\nDecide per pair whether the en/ variant is a translation of the original (drop "
+              "it) or a distinct lesson (make task_id carry the language). Nothing is written "
+              "until that is answered.", file=sys.stderr)
+        raise SystemExit(1)
 
     # Write tasks
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
