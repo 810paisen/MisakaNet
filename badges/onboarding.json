@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "label": "onboarding",
-  "message": "setup 62/wk · MCP 2.7k/day",
+  "message": "setup 62/wk · MCP 4.1k/day",
   "color": "blue",
-  "generated_at": "2026-10-15T16:37:53Z",
+  "generated_at": "2026-10-15T17:06:41Z",
   "window": {
     "downloads": "last-week",
     "activity": "2026-10-15",
@@ -15,15 +15,15 @@
   },
   "activity": {
     "date": "2026-10-15",
-    "total": 2815,
+    "total": 4347,
     "calls": {
-      "agent": 28,
-      "crawler": 8,
-      "mcp": 2669,
-      "pageview": 110
+      "agent": 64,
+      "crawler": 18,
+      "mcp": 4128,
+      "pageview": 137
     }
   },
   "traffic": null,
-  "mcp_per_weekly_install": 301.3,
+  "mcp_per_weekly_install": 466.1,
   "mcp_per_weekly_install_note": "proxy, not a conversion rate: npx caching depresses the denominator and one agent makes many calls. Read it as a trend, never as a score."
 }
