@@ -743,6 +743,100 @@ def calculate_confidence(body: str, is_test: bool) -> float:
     return min(1.0, confidence)
 
 
+# === Placeholder / fixture detection ===
+# Two fixtures from this repository's own test suite reached the live pipeline three
+# seconds apart (#3136 / #3137) and were judged as real reports; the complete-looking
+# one landed in the human queue as needs-human-review + type:bug + priority:high, with
+# the literal string `test-verification` in its body.
+#
+# This is a classifier, not a threshold, and the measurements are why: no placeholder
+# body reaches the approval band. The most complete one built (frontmatter, six
+# sections, padding to raise the word count) scored 65.75 against a threshold of 75,
+# and the gap is closed by two dimensions that have nothing to do with fixtures —
+# "Only 1 generic tech keywords" and "Contains specific project names". So a guard
+# here moves nothing on the scoring path and no weight or threshold is touched.
+#
+# Two signals, and neither is a bare prefix match:
+#   * every acceptance-criteria value is a `test-*` placeholder — with the section
+#     required to be present and to carry at least one value, because "all values
+#     match" is vacuously true when there are none, and a report legitimately has no
+#     acceptance criteria (`issue-quality-gate.yml` exempts them as "reports, not
+#     specs"). Getting that wrong rejects every AC-less report in the repository.
+#   * the problem section is a single `test-*` token. Anchoring on "starts with
+#     test-" instead would swallow "test-flaky CI fails on the 3.12 runner", which is
+#     a genuine report about test infrastructure.
+PLACEHOLDER_SOLE_TOKEN = re.compile(r"^test[-_ ]?[a-z0-9][a-z0-9._-]*$", re.IGNORECASE)
+LIST_MARKER = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+
+def _section_is_truncated(body: str, names: tuple[str, ...]) -> bool:
+    """True when the named section ends because a `###` subheading cut it short.
+
+    `_section_text` stops at the first `#{2,3}` heading after the one it matched, so a report
+    written as
+
+        ## Problem
+        test-hang
+        ### Steps
+        1. run the suite
+
+    reads as a one-line Problem section — the evidence sits below the cut. Judging "the whole
+    section is one placeholder token" on a section we truncated would classify on the part we
+    happened to keep, so this reports the truncation and the caller declines to judge.
+    """
+    current = None
+    for line in body.splitlines():
+        heading = re.match(r"^#{2,3}\s*(.+?)\s*$", line)
+        if not heading:
+            continue
+        title = heading.group(1).strip().lower()
+        if current is None:
+            if any(name in title for name in names):
+                current = title
+            continue
+        # First heading after the matched one. `###` = a subsection, so the section had more.
+        return bool(re.match(r"^#{3,}\s", line))
+    return False
+
+
+def detect_placeholder_fixture(body: str) -> tuple[bool, str]:
+    """True when the body is a test fixture rather than a report. Returns (hit, reason)."""
+    if not body:
+        return False, ""
+
+    stripped = strip_pipeline_boilerplate(body)
+
+    acceptance = _section_text(stripped, ("acceptance criteria", "acceptance"))
+    values = [
+        LIST_MARKER.sub("", line).strip()
+        for line in acceptance.splitlines()
+        if LIST_MARKER.match(line)
+    ]
+    values = [v for v in values if v]
+    # `PLACEHOLDER_SOLE_TOKEN`, not a bare `^test-` prefix: a report *about* test infrastructure
+    # is a real report and its acceptance criteria can legitimately read "test-hang predates my
+    # change". The problem anchor already required the whole line to be one token; this one did
+    # not, so a report on that exact subject was swallowed. Both anchors are now the same shape.
+    if values and all(PLACEHOLDER_SOLE_TOKEN.match(v) for v in values):
+        return True, (
+            f"all {len(values)} acceptance criteria are test placeholders "
+            f"({', '.join(values[:3])})"
+        )
+
+    if _section_is_truncated(stripped, ("problem", "问题")):
+        return False, ""            # the section was cut short; do not judge the remainder
+
+    problem = [
+        line.strip()
+        for line in _section_text(stripped, ("problem", "问题")).splitlines()
+        if line.strip()
+    ]
+    if problem and all(PLACEHOLDER_SOLE_TOKEN.match(line) for line in problem):
+        return True, f"the problem section is the bare placeholder {problem[0]!r}"
+
+    return False, ""
+
+
 # === Decision Maker ===
 
 def make_decision(final_score: float, confidence: float) -> str:
@@ -904,6 +998,17 @@ def auto_review_issue(
     # Step 8: Make decision
     result.decision = make_decision(result.final_score, result.confidence)
 
+    # A fixture is not a report that scored badly, so it gets its own decision rather
+    # than the nearest score band. Routing it to `reject` would hand it to the daily
+    # salvage digest, which sweeps the `auto-rejected` label and puts
+    # `needs-human-review` straight back on it the next morning — the opposite of what
+    # this is for. The score is left exactly as computed, so the JSON still shows what
+    # the body would have scored and nothing on the scoring path moves.
+    placeholder, why = detect_placeholder_fixture(body)
+    if placeholder:
+        result.decision = "placeholder"
+        result.reasons.append(f"✗ Detected a test fixture rather than a report: {why}")
+
     # Step 9: Collect reasons and suggestions
     for dim in result.dimensions:
         result.reasons.extend(dim.reasons)
@@ -956,6 +1061,10 @@ def format_result_comment(result: AutoReviewResult) -> str:
         lines.append("## [APPROVED] Auto-Approved — Lesson Created\n")
     elif result.decision == "review":
         lines.append("## [REVIEW] Needs Human Review\n")
+    elif result.decision == "placeholder":
+        # Same fall-through as the decision line below: `placeholder` had no arm here either, so
+        # the heading said Auto-Rejected on an issue that was never rejected.
+        lines.append("## [FIXTURE] Test Fixture Detected — Not a Report\n")
     else:
         lines.append("## [REJECTED] Auto-Rejected\n")
 
@@ -1006,6 +1115,21 @@ def format_result_comment(result: AutoReviewResult) -> str:
         lines.append(f"- Approve: convert to lesson")
         lines.append(f"- Improve: request changes")
         lines.append(f"- Reject: close issue")
+    elif result.decision == "placeholder":
+        # Without this arm the decision fell through to `else` and printed "Auto-rejected
+        # (weighted score < 40)" next to a score table that read 64.25 — a false statement on the
+        # issue, and "Rejection Reasons" on something that was not rejected. The score is real and
+        # is still shown above; what differs is what was done with it.
+        lines.append("**Decision:** Not a report — test fixture detected")
+        lines.append(
+            "\nThe acceptance criteria (or problem statement) are `test-*` placeholders, so this "
+            "was generated by an automated probe rather than reported by a person. It is labelled "
+            "`auto-placeholder` and is **not** queued for maintainer review."
+        )
+        lines.append(
+            "\nIf this is a real report, say so on the issue and it will be re-scored — the label "
+            "is only visible to this workflow, not to a human review queue."
+        )
     else:
         lines.append(f"**Decision:** Auto-rejected (weighted score < {THRESHOLD_REVIEW})")
         lines.append(f"\n**Rejection Reasons:**")
