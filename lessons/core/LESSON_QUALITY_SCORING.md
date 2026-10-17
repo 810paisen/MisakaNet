@@ -1,61 +1,59 @@
 ---
 {
-  "provenance": {"source": "intake", "issue": "#2472", "related": ["#2484"]},
-  "domain": "development",
-  "title": "macOS SwiftUI Security-Scoped Bookmarks and HSplitView Scroll Reset",
+  "provenance": {"source": "intake", "issue": "#2750", "related": ["#2760"]},
+  "domain": "dsh",
+  "title": "DSH Plugin Sidebar and Panel View Registration Contracts",
   "tags": [
-    "macos",
-    "swiftui",
-    "sandboxing",
-    "scrollview"
+    "dsh",
+    "plugin",
+    "sidebar",
+    "mcp"
   ],
   "status": "published",
   "evidence_level": "E1",
-  "summary_plain": "macOS沙盒App中通过安全书签管理外部文件访问，使用ScrollViewReader避免HSplitView分栏比例异常抖动。",
-  "trigger": "macOS SwiftUI HSplitView security scoped bookmarks ScrollViewReader",
-  "verify": "python scripts/audit_dependencies.py 退出码为 0"
+  "summary_plain": "DSH插件需在七个扩展席位完成显式注册并遵守启动依赖时序，才能正常挂载侧边栏面板与状态徽章。",
+  "trigger": "sidebar acceptance results dsh plugin surface registration",
+  "verify": "pytest tests/test_dsh_plugin_surface.py 退出码为 0"
 }
 ---
 
-In native sandboxed macOS SwiftUI applications, managing external filesystem access and resetting split detail scroll views requires careful orchestration to prevent permission drops and UI layout shifts.
+In DeepSeek Harness (DSH) desktop and web environments, registering a companion plugin into the application shell requires adhering to strict extension point contracts across seven UI injection seats.
 
 ## Problem
 
-Developers building native macOS desktop tools encounter two critical architecture challenges:
-1. **Sandboxed File Ingest & Persistence**: External files selected via `NSOpenPanel` become inaccessible across app restarts unless persistent security-scoped bookmarks are stored alongside SwiftData models.
-2. **HSplitView Scroll Reset Jitter**: When switching selected records in an `HSplitView`, forcing a scroll-to-top by changing the `ScrollView`'s identity (`.id(record.id)`) destroys view state and resets the user's split divider position.
+When installing client-side plugins into DSH profiles (`~/.dsh/profiles/web`), developers report missing panel tabs, unrendered icon glyphs, or boot graph errors:
+```
+Failed to mount sidebar extension: seat 'sidebar.panellist' unmapped in client bundle.
+```
+While static contract tests may report green, UI components fail to appear in the left rail or right drawer if registration order is inverted.
 
 ## Root Cause
 
-- **App Sandbox Confinement**: macOS App Sandbox revokes temporary file access granted by `NSOpenPanel` once the host process terminates. Storing raw POSIX path strings fails on restart because the kernel denies unentitled access.
-- **Divider Allocation Invalidation**: `HSplitView` calculates child frame allocations based on stable view identities. Assigning a dynamic `.id()` modifier to the detail pane causes SwiftUI to tear down and rebuild the pane, resetting divider ratios back to system defaults.
+DSH defines seven adjacent extension points for plugin integration:
+1. `conversation.view`
+2. `sidebar.panellist`
+3. `main`
+4. `shell.overlay`
+5. `sidebar.footer.action`
+6. `sidebar.right.pane.tab`
+7. `sidebar.right.pane.tab.title`
+
+If a plugin loads before its host bundle (`@deepseek-ai/dsh-web-app`) in the boot graph, or fails to provide an explicit icon registration on `sidebar.panellist` (lines 1839–1847 in client bundles), the web shell ignores the plugin registration and mounts an empty placeholder.
 
 ## Fix
 
-1. **Security-Scoped Bookmark Management**: Create a persistent bookmark upon user selection via `url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)`. On app launch, resolve the bookmark and wrap access inside `url.startAccessingSecurityScopedResource()` and `defer { url.stopAccessingSecurityScopedResource() }`.
-2. **Stable ScrollView with ScrollViewReader**: Maintain a stable identity on the detail container and use `ScrollViewReader` to programmatically reset the scroll offset:
-```swift
-ScrollViewReader { proxy in
-    ScrollView {
-        Color.clear.frame(height: 0).id("TOP_ANCHOR")
-        DetailContent(record: selectedRecord)
-    }
-    .onChange(of: selectedRecord.id) { _ in
-        withAnimation {
-            proxy.scrollTo("TOP_ANCHOR", anchor: .top)
-        }
-    }
-}
-```
+1. Share the primary panel component (`MisakanetPanel`) across `conversation.view`, `main`, and `sidebar.right.pane.tab`.
+2. Register an explicit 9-line icon component (`MisakanetPanelIcon`) on `sidebar.panellist` to ensure left-rail badge rendering.
+3. Verify that host shell dependencies load at lower indices in the profile boot graph prior to mounting downstream plugins.
 
 ## Verification
 
-Run project dependency and structural verification to confirm lesson format integrity:
+Run the DSH plugin surface contract suite to verify all seven injection points are correctly satisfied:
 
 ```bash
-python scripts/audit_dependencies.py
+pytest tests/test_dsh_plugin_surface.py
 ```
 Expected output:
 ```
-Auditing dependencies and lesson schemas... OK: All structures valid.
+tests/test_dsh_plugin_surface.py::test_extension_seats PASSED (42/42 green)
 ```
