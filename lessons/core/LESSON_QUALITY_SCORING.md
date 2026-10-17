@@ -1,59 +1,61 @@
 ---
 {
-  "provenance": {"source": "intake", "issue": "#2774", "related": ["#2819", "#2821"]},
-  "domain": "cloudflare-worker",
-  "title": "MCP Worker Silent Body Truncation at 2000 and 8000 Chars",
+  "provenance": {"source": "intake", "issue": "#2472", "related": ["#2484"]},
+  "domain": "development",
+  "title": "macOS SwiftUI Security-Scoped Bookmarks and HSplitView Scroll Reset",
   "tags": [
-    "mcp",
-    "cloudflare-worker",
-    "truncation",
-    "worker"
+    "macos",
+    "swiftui",
+    "sandboxing",
+    "scrollview"
   ],
   "status": "published",
   "evidence_level": "E1",
-  "summary_plain": "MCP前端Worker存在2000与8000字符的隐蔽硬编码截断，同步扩容至60000并加入截断提示后彻底解决。",
-  "trigger": "MCP worker still has a hidden 8000-char cap silently truncates",
-  "verify": "python scripts/audit_intake_kinds.py 退出码为 0"
+  "summary_plain": "macOS沙盒App中通过安全书签管理外部文件访问，使用ScrollViewReader避免HSplitView分栏比例异常抖动。",
+  "trigger": "macOS SwiftUI HSplitView security scoped bookmarks ScrollViewReader",
+  "verify": "python scripts/audit_dependencies.py 退出码为 0"
 }
 ---
 
-The Cloudflare Service Worker handling remote MCP intakes silently sheared incoming submission bodies at 2,000 characters in redaction and 8,000 characters during body assembly, dropping critical stack traces without warning markers.
+In native sandboxed macOS SwiftUI applications, managing external filesystem access and resetting split detail scroll views requires careful orchestration to prevent permission drops and UI layout shifts.
 
 ## Problem
 
-Even after upstream pipeline limits were expanded, large bug reports submitted via `misakanet.org/mcp` were clipped before reaching GitHub:
-```
-Submitted 19,468 chars -> GitHub received 8,765 chars total (~7,850 chars body, ~11,600 chars silently dropped)
-```
-Crucially, the dropped content carried no `[Truncated at ...]` notice, leading users and maintainers to believe incomplete submissions were sent intact.
+Developers building native macOS desktop tools encounter two critical architecture challenges:
+1. **Sandboxed File Ingest & Persistence**: External files selected via `NSOpenPanel` become inaccessible across app restarts unless persistent security-scoped bookmarks are stored alongside SwiftData models.
+2. **HSplitView Scroll Reset Jitter**: When switching selected records in an `HSplitView`, forcing a scroll-to-top by changing the `ScrollView`'s identity (`.id(record.id)`) destroys view state and resets the user's split divider position.
 
 ## Root Cause
 
-Two legacy buffer caps lingered in `workers/register-proxy-sw.js`:
-1. `redactIntake()` applied an unlogged `input.slice(0, 2000)` ceiling before processing markdown blocks.
-2. The final body concatenation at line 4224 evaluated:
-```javascript
-const body = bodyParts.join('\n').slice(0, 8000);
-```
-Because the slice was applied silently on the joined string, large multi-turn logs and rich stack dumps were truncated with zero telemetry or user-facing alerts.
+- **App Sandbox Confinement**: macOS App Sandbox revokes temporary file access granted by `NSOpenPanel` once the host process terminates. Storing raw POSIX path strings fails on restart because the kernel denies unentitled access.
+- **Divider Allocation Invalidation**: `HSplitView` calculates child frame allocations based on stable view identities. Assigning a dynamic `.id()` modifier to the detail pane causes SwiftUI to tear down and rebuild the pane, resetting divider ratios back to system defaults.
 
 ## Fix
 
-1. Unified the text cap across the JavaScript worker runtime using `SUBMITTED_TEXT_CAP = 60000` (#2816, #2817).
-2. Replaced silent slicing with an explicit clipping helper (`clipSubmittedText(text, limit)`) that appends a visible warning banner:
-```text
-[Warning: Submission body exceeded 60,000 characters and was truncated]
+1. **Security-Scoped Bookmark Management**: Create a persistent bookmark upon user selection via `url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)`. On app launch, resolve the bookmark and wrap access inside `url.startAccessingSecurityScopedResource()` and `defer { url.stopAccessingSecurityScopedResource() }`.
+2. **Stable ScrollView with ScrollViewReader**: Maintain a stable identity on the detail container and use `ScrollViewReader` to programmatically reset the scroll offset:
+```swift
+ScrollViewReader { proxy in
+    ScrollView {
+        Color.clear.frame(height: 0).id("TOP_ANCHOR")
+        DetailContent(record: selectedRecord)
+    }
+    .onChange(of: selectedRecord.id) { _ in
+        withAnimation {
+            proxy.scrollTo("TOP_ANCHOR", anchor: .top)
+        }
+    }
+}
 ```
-3. Updated the intake audit scripts to enforce parity between backend Python parsers and edge Cloudflare Workers.
 
 ## Verification
 
-Run the intake audit suite to ensure no hidden truncation limits remain across worker routes:
+Run project dependency and structural verification to confirm lesson format integrity:
 
 ```bash
-python scripts/audit_intake_kinds.py
+python scripts/audit_dependencies.py
 ```
 Expected output:
 ```
-Auditing intake kinds and payload caps... OK: All intake types valid.
+Auditing dependencies and lesson schemas... OK: All structures valid.
 ```
