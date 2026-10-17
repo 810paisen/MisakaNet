@@ -1,45 +1,54 @@
 ---
 {
-  "provenance": {"source": "intake", "issue": "#2818", "related": ["#2833"]},
-  "domain": "mcp",
-  "title": "Intake Text Cap and Body Assembly Truncation Fix",
+  "provenance": {"source": "intake", "issue": "#2774", "related": ["#2819", "#2821"]},
+  "domain": "cloudflare-worker",
+  "title": "MCP Worker Silent Body Truncation at 2000 and 8000 Chars",
   "tags": [
-    "intake",
-    "truncation",
     "mcp",
-    "dsh"
+    "cloudflare-worker",
+    "truncation",
+    "worker"
   ],
   "status": "published",
   "evidence_level": "E1",
-  "summary_plain": "MCP问题录入因硬编码2000字符截断导致长日志丢失，将组装上限扩充至60000字符后彻底解决。",
-  "trigger": "intake body assembly cap raised to 60000",
+  "summary_plain": "MCP前端Worker存在2000与8000字符的隐蔽硬编码截断，同步扩容至60000并加入截断提示后彻底解决。",
+  "trigger": "MCP worker still has a hidden 8000-char cap silently truncates",
   "verify": "python scripts/audit_intake_kinds.py 退出码为 0"
 }
 ---
 
-Large question intakes submitted via the DSH MCP sidebar were being prematurely truncated to 2,000 characters, dropping vital stack traces and multi-turn debug context before issue creation.
+The Cloudflare Service Worker handling remote MCP intakes silently sheared incoming submission bodies at 2,000 characters in redaction and 8,000 characters during body assembly, dropping critical stack traces without warning markers.
 
 ## Problem
 
-When developers submit long diagnostic dumps or complex bug reports exceeding 2,000 characters through the remote MCP intake interface, incoming issue bodies were hard-clipped:
+Even after upstream pipeline limits were expanded, large bug reports submitted via `misakanet.org/mcp` were clipped before reaching GitHub:
 ```
-Submitted 22,690 chars should arrive in full at GitHub, NOT clipped to 2000.
+Submitted 19,468 chars -> GitHub received 8,765 chars total (~7,850 chars body, ~11,600 chars silently dropped)
 ```
-The truncation discarded logs, configuration snippets, and multi-file context, leaving maintainers unable to reproduce the reported errors.
+Crucially, the dropped content carried no `[Truncated at ...]` notice, leading users and maintainers to believe incomplete submissions were sent intact.
 
 ## Root Cause
 
-Early implementations of the intake handler and sidebar fragment assembler applied a conservative 2,000-character ceiling to guard against memory bloat. As the agent architecture evolved to support complete traceback logs and rich markdown payloads, this hardcoded slicing limit remained unadjusted, creating a silent truncation bottleneck during message serialization.
+Two legacy buffer caps lingered in `workers/register-proxy-sw.js`:
+1. `redactIntake()` applied an unlogged `input.slice(0, 2000)` ceiling before processing markdown blocks.
+2. The final body concatenation at line 4224 evaluated:
+```javascript
+const body = bodyParts.join('\n').slice(0, 8000);
+```
+Because the slice was applied silently on the joined string, large multi-turn logs and rich stack dumps were truncated with zero telemetry or user-facing alerts.
 
 ## Fix
 
-1. Raised the intake text cap and body fragment assembly limit from 2,000 to 60,000 characters across the intake ingest pipeline (#2816, #2829).
-2. Implemented chunked multi-fragment streaming assembly for incoming payload buffers to prevent buffer overflow.
-3. Added automated intake payload length validation ensuring payloads up to 60,000 characters pass end-to-end to GitHub issue creation without data loss.
+1. Unified the text cap across the JavaScript worker runtime using `SUBMITTED_TEXT_CAP = 60000` (#2816, #2817).
+2. Replaced silent slicing with an explicit clipping helper (`clipSubmittedText(text, limit)`) that appends a visible warning banner:
+```text
+[Warning: Submission body exceeded 60,000 characters and was truncated]
+```
+3. Updated the intake audit scripts to enforce parity between backend Python parsers and edge Cloudflare Workers.
 
 ## Verification
 
-Run the intake kinds audit script to confirm payload handling is healthy across all intake sources:
+Run the intake audit suite to ensure no hidden truncation limits remain across worker routes:
 
 ```bash
 python scripts/audit_intake_kinds.py
