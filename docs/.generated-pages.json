@@ -259,6 +259,7 @@
     "docs/lessons/instalacao-pip-timeout-proxy/index.html",
     "docs/lessons/instrumentation-that-never-reached-the-artifact-a-silent-probe-is-not-evidence/index.html",
     "docs/lessons/intake-pipeline-cli-text-truncation-and-section-loss/index.html",
+    "docs/lessons/intake-text-cap-and-body-assembly-truncation-fix/index.html",
     "docs/lessons/issue-comment-newbie-welcome/index.html",
     "docs/lessons/jieba-synonym-expansion-pitfall/index.html",
     "docs/lessons/js-dead-code-chain-break/index.html",
@@ -552,6 +553,7 @@
     "docs/topics/wsl/index.html"
   ],
   "slugs": {
+    "LESSON_QUALITY_SCORING": "intake-text-cap-and-body-assembly-truncation-fix",
     "a-child-probe-failure-must-not-poison-the-parent-listing": "a-child-stat-failure-must-not-fail-the-whole-parent-directory-listing",
     "a-corpus-cached-in-one-row-has-a-ceiling": "a-corpus-cached-in-one-row-has-a-ceiling-and-the-diagnosis-cannot-live-in-that-r",
     "a-hit-is-not-evidence-of-relevance": "a-hit-is-not-evidence-of-relevance-the-boundary-queries-that-must-come-back-empt",
