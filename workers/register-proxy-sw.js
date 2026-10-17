@@ -2340,7 +2340,18 @@ async function refreshSearchIndex(env) {
   if (!hasDurableStore(env)) return { refreshed: false, reason: "no storage" };
   try {
     // From D1, not from the cached lessons payload — see loadLessonsFresh (#1731).
-    const lessons = (await loadLessonsFresh(env)) || (await loadLessons(env));
+    //
+    // And **not** from the quota fallback: rebuilding from the snapshot is how a thin corpus becomes a
+    // thin *index* (2026-10-17 — 192 indexed, 501 in the corpus, search silently answering `no_match`).
+    // A failing D1 means "keep the previous index", not "reindex from whatever answered".
+    const fresh = await loadLessonsFresh(env);
+    let lessons = fresh;
+    if ((!Array.isArray(lessons) || lessons.length === 0) && d1Binding(env)) {
+      return { refreshed: false, reason: "d1 unavailable — keeping the previous index" };
+    }
+    if (!Array.isArray(lessons) || lessons.length === 0) {
+      lessons = await loadLessons(env);
+    }
     if (!Array.isArray(lessons) || lessons.length === 0) {
       return { refreshed: false, reason: "no lessons" };
     }
