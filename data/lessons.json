@@ -1,5 +1,36 @@
 [
   {
+    "id": "agentcap-registry-secret-safe-validation-failure-metadata",
+    "title": "AgentCap Registry Secret-Safe Validation Failure in Capability Metadata",
+    "domain": "security",
+    "tags": [
+      "agentcap",
+      "registry",
+      "security",
+      "validation"
+    ],
+    "summary": "AgentCap capability registry verification reports secret-safe validation failures on capability descriptions and guidance metadata, causing the coordinator to m…",
+    "preview": "AgentCap capability registry verification reports secret-safe validation failures on capability descriptions and guidance metadata, causing the coordinator to mark the registry as untrusted and fall back to unoptimized local extraction.\n\n## Problem\n\nDuring automated registry synchronization, read-only capability registries fail the security gate:\n```\nFAIL: secret-safe; last refresh: validation-failed; Healthy: False\n```\nWhile structural schemas and timestamp freshness checks pass cleanly, the secret scanner flags the capability metadata as containing sensitive credentials, blocking registry caching.\n\n## Root Cause\n\nThe secret-safe gate scans documentation strings, parameter examples, and guidance descriptions using broad credential matching regular expressions. When tool documentation includes dummy parameter placeholders (such as `Bearer <token>` or mock API keys), the scanner flags these documentation snippets as high-confidence credential leaks, triggering a validation failure.\n\n## Fix\n\n1. Isolate descriptor documentation fields from active credential configuration inputs prior to security scanning.\n2. Standardize mock parameter placeholders in capability definitions using neutral sanitization tokens (`<TOKEN_PLACEHOLDER>`).\n3. Configure the scanner rule engine to enforce boundary assertions, distinguishing documentation sample snippets from live credentials.\n\n## Verification\n\nRun the capability verification command to confirm that metadata passes the secret-safe check:\n\n```bash\npython scripts/audit_dependencies.py\n```\nExpected output:\n```\nCapability registry verification: PASSED (secret-safe: clean, Healthy: True)\n```",
+    "summary_plain": "能力注册表因描述元数据命中正则导致secret-safe假阳性报错，通过添加边界排除伪阳性即可恢复信任。",
+    "trigger": "FAIL secret-safe last refresh validation-failed",
+    "verify": "python scripts/audit_dependencies.py 退出码为 0",
+    "url": "lessons/core/agentcap-registry-secret-safe-validation-failure-metadata.md",
+    "created": "",
+    "updated": "",
+    "triggers": null,
+    "validity_period_days": 365,
+    "environment_version": "",
+    "confidence": 0.5,
+    "status": "published",
+    "evidence_refs": [],
+    "supersedes": "",
+    "verified": true,
+    "evidence_level": "E1",
+    "evidence_source": "frontmatter",
+    "trust_score": 0.387,
+    "contributor": ""
+  },
+  {
     "id": "allowlist-must-be-tested-against-the-corpus",
     "title": "An allowlist that rejects real data is worse than no validation — test the rule against the corpus",
     "domain": "testing",
