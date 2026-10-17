@@ -1,19 +1,19 @@
 [
   {
     "id": "LESSON_QUALITY_SCORING",
-    "title": "DSH Plugin Sidebar and Panel View Registration Contracts",
-    "domain": "dsh",
+    "title": "Intake Stress Testing for 20K to 60K Payload Boundaries",
+    "domain": "testing",
     "tags": [
-      "dsh",
-      "plugin",
-      "sidebar",
-      "mcp"
+      "testing",
+      "intake",
+      "stress-test",
+      "truncation"
     ],
-    "summary": "In DeepSeek Harness (DSH) desktop and web environments, registering a companion plugin into the application shell requires adhering to strict extension point co…",
-    "preview": "In DeepSeek Harness (DSH) desktop and web environments, registering a companion plugin into the application shell requires adhering to strict extension point contracts across seven UI injection seats.\n\n## Problem\n\nWhen installing client-side plugins into DSH profiles (`~/.dsh/profiles/web`), developers report missing panel tabs, unrendered icon glyphs, or boot graph errors:\n```\nFailed to mount sidebar extension: seat 'sidebar.panellist' unmapped in client bundle.\n```\nWhile static contract tests may report green, UI components fail to appear in the left rail or right drawer if registration order is inverted.\n\n## Root Cause\n\nDSH defines seven adjacent extension points for plugin integration:\n1. `conversation.view`\n2. `sidebar.panellist`\n3. `main`\n4. `shell.overlay`\n5. `sidebar.footer.action`\n6. `sidebar.right.pane.tab`\n7. `sidebar.right.pane.tab.title`\n\nIf a plugin loads before its host bundle (`@deepseek-ai/dsh-web-app`) in the boot graph, or fails to provide an explicit icon registration on `sidebar.panellist` (lines 1839–1847 in client bundles), the web shell ignores the plugin registration and mounts an empty placeholder.\n\n## Fix\n\n1. Share the primary panel component (`MisakanetPanel`) across `conversation.view`, `main`, and `sidebar.right.pane.tab`.\n2. Register an explicit 9-line icon component (`MisakanetPanelIcon`) on `sidebar.panellist` to ensure left-rail badge rendering.\n3. Verify that host shell dependencies load at lower indices in the profile boot graph prior to mounting downstream plugins.\n\n## Verification\n\nRun the DSH plugin surface contract suite to verify all seven injection points are correctly satisfied:\n\n```bash\npytest tests/test_dsh_plugin_surface.py\n```\nExpected output:\n```\ntests/test_dsh_plugin_surface.py::test_extension_seats PASSED (42/42 green)\n```",
-    "summary_plain": "DSH插件需在七个扩展席位完成显式注册并遵守启动依赖时序，才能正常挂载侧边栏面板与状态徽章。",
-    "trigger": "sidebar acceptance results dsh plugin surface registration",
-    "verify": "pytest tests/test_dsh_plugin_surface.py 退出码为 0",
+    "summary": "Automated stress testing of intake payloads between 20,000 and 60,000 characters requires end-to-end length verification across edge Cloudflare Workers and back…",
+    "preview": "Automated stress testing of intake payloads between 20,000 and 60,000 characters requires end-to-end length verification across edge Cloudflare Workers and backend API adapters to prevent silent payload loss.\n\n## Problem\n\nWhen verifying whether truncation fixes hold under production conditions, developers running high-volume stress tests (such as deliberate 20,000+ character submissions) encountered conflicting test results:\n```\nSubmitted 22,690 chars should arrive in full at GitHub, NOT clipped to 2000.\n```\nWhile small mock inputs (&lt;2,000 characters) passed all unit tests, realistic debug dumps containing dense stack traces and configuration blocks were intermittently clipped by intermediate proxies.\n\n## Root Cause\n\nTest suites historically evaluated synthetic single-line strings that never exercised memory buffers or multi-chunk streaming handlers. In production, edge workers (such as Cloudflare Service Workers) and backend intake scripts (`scripts/intake_pipeline.py`) enforced differing buffer limits. Without synchronized end-to-end stress tests, multi-stage pipelines passed localized unit tests while failing live high-volume transmissions.\n\n## Fix\n\n1. Created dedicated stress test fixtures with multi-section payloads scaled to 20,000 and 60,000 characters (#2769, #2833).\n2. Embedded self-referential token markers at the head, midpoint, and tail of stress payloads to verify zero loss across pipeline boundaries.\n3. Asserted that submissions below the `SUBMITTED_TEXT_CAP = 60000` ceiling land on GitHub with 100% byte fidelity and zero truncation notice banners.\n\n## Verification\n\nRun the intake audit script to verify that payload validation logic correctly enforces 60,000-character capacity across all sources:\n\n```bash\npython scripts/audit_intake_kinds.py\n```\nExpected output:\n```\nAuditing intake kinds and payload caps... OK: All intake types valid.\n```",
+    "summary_plain": "通过2万至6万字符高负载压力测试用例验证全链路传输，确保大体积工单在边缘与后端间零截断。",
+    "trigger": "20K truncation test deliberate stress test body assembly cap",
+    "verify": "python scripts/audit_intake_kinds.py 退出码为 0",
     "url": "lessons/core/LESSON_QUALITY_SCORING.md",
     "created": "",
     "updated": "",
