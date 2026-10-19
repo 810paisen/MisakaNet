@@ -516,6 +516,14 @@
     border-radius: 4px 4px 0 0;
     background: linear-gradient(180deg, var(--cyan), rgba(0, 229, 255, 0.28));
   }
+  /* A day whose counters could not be read (#3544). Empty with a dashed outline, because a
+     zero-height solid bar is exactly what "no calls that day" draws — and the point is that those
+     are different statements. */
+  .activity-history-bar.is-unreadable {
+    background: transparent;
+    border: 1px dashed rgba(148, 163, 184, 0.65);
+    min-height: 10px;
+  }
   /* The newest bar is the day in progress, so its height is a floor and not a total. Hatched,
      because a colour difference alone is not a claim a reader can act on. */
   .activity-history-bar.is-partial {
@@ -3581,13 +3589,15 @@ function activityHistoryMarkup(series, generatedAt, live, source) {
     // as such, because a partial bar drawn like a finished one is the chart equivalent of calling a
     // snapshot "today".
     const partial = day.date === today;
+    const unreadable = Array.isArray(day.unreadable) && day.unreadable.length > 0;
     const height = total > 0 ? `max(2px, ${Math.round((total / max) * 100)}%)` : '0';
-    const label = `${day.date} · ${formatCount(total)}` +
-                  (partial ? ` · ${t('activityTrendPartial')}` : '');
+    const label = unreadable
+      ? `${day.date} · ${t('activityUnreadable')} (${day.unreadable.join(', ')})`
+      : `${day.date} · ${formatCount(total)}` + (partial ? ` · ${t('activityTrendPartial')}` : '');
     return `
         <div class="activity-history-slot">
-          <div class="activity-history-bar${partial ? ' is-partial' : ''}" style="height:${height}"
-               title="${escapeHTML(label)}"></div>
+          <div class="activity-history-bar${partial ? ' is-partial' : ''}${unreadable ? ' is-unreadable' : ''}"
+               style="height:${unreadable ? '0' : height}" title="${escapeHTML(label)}"></div>
           <div class="activity-history-day">${escapeHTML(day.date.slice(5))}</div>
         </div>`;
   }).join("");
@@ -3599,11 +3609,14 @@ function activityHistoryMarkup(series, generatedAt, live, source) {
   // of each day, taken before the day ended), and a chart that does not say so overstates the trend's
   // precision. The route's own series is a full day total per day and says what it is not.
   const bounds = String(source || '').startsWith('git-history:');
-  const note = t(bounds ? 'activityTrendBounds' : 'activityTrendNote');
+  const anyUnreadable = series.some(day => Array.isArray(day.unreadable) && day.unreadable.length);
+  const note = anyUnreadable
+    ? t('activityUnreadableNote')
+    : t(bounds ? 'activityTrendBounds' : 'activityTrendNote');
   return `
       <div class="activity-history-head">
         <span class="activity-history-title">${formatText(t('activityTrendTitle'), { days: series.length })}</span>
-        <span class="activity-history-note" data-i18n="${bounds ? 'activityTrendBounds' : 'activityTrendNote'}">${note}</span>
+        <span class="activity-history-note" data-i18n="${anyUnreadable ? 'activityUnreadableNote' : (bounds ? 'activityTrendBounds' : 'activityTrendNote')}">${note}</span>
       </div>
       <div class="activity-history-bars">${slots}</div>
       <div class="activity-footnote">${escapeHTML(series[0].date)} – ${escapeHTML(series[series.length - 1].date)}${how ? ' · ' + how : ''}</div>`;
