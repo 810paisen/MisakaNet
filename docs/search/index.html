@@ -40,7 +40,7 @@
   .result-meta { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
   .badge { font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 600; font-family: var(--font-ui); }
   .badge-domain { background: rgba(88,166,255,0.1); color: #58a6ff; }
-  .badge-status { background: rgba(35,134,54,0.15); color: #3fb950; }
+  .badge-plain { background: rgba(148,163,184,0.15); color: #94a3b8; }
   .badge-fatal { background: rgba(239,68,68,0.12); color: #f87171; }
   .badge-runtime { background: rgba(251,146,60,0.12); color: #fb923c; }
   .badge-setup { background: rgba(56,189,248,0.12); color: #38bdf8; }
@@ -93,7 +93,7 @@
   <div class="topbar">
     <div>
       <a href="/" class="home-link" data-i18n="goHome">← Go to homepage</a>
-      <h1 data-i18n="heading">Search Verified Failure Lessons</h1>
+      <h1 data-i18n="heading">Search Failure Lessons</h1>
       <p class="subtitle" data-i18n="subtitle">Reviewed fixes from real agent debugging sessions. Not random chat logs.</p>
     </div>
     <div class="lang-switch" aria-label="Language">
@@ -116,8 +116,8 @@
 <script>
 const I18N = {
   en: {
-    pageTitle: 'Search Verified Failure Lessons — MisakaNet',
-    heading: 'Search Verified Failure Lessons',
+    pageTitle: 'Search Failure Lessons — MisakaNet',
+    heading: 'Search Failure Lessons',
     subtitle: 'Reviewed fixes from real agent debugging sessions. Not random chat logs.',
     placeholder: 'Search lessons... (e.g., pip timeout, database locked, profinet)',
     loading: 'Loading lessons...',
@@ -146,7 +146,7 @@ const I18N = {
     badgeFatal: 'Fatal Pitfall',
     badgeRuntime: 'Runtime Failure',
     badgeSetup: 'Setup Fix',
-    badgeVerified: 'Verified',
+    badgeOther: 'General',
     githubAudited: 'GitHub-audited'
   },
   zh: {
@@ -180,7 +180,7 @@ const I18N = {
     badgeFatal: '致命踩坑',
     badgeRuntime: '运行失败',
     badgeSetup: '配置修复',
-    badgeVerified: '已验证',
+    badgeOther: '通用',
     githubAudited: 'GitHub 审核'
   }
 };
@@ -364,12 +364,16 @@ function getTakeaway(r) {
   return takeaway || r.title || '';
 }
 
+// The kind of failure, not its trustworthiness. This used to fall through to a green "Verified"
+// badge for anything the keywords did not classify — and no branch read `evidence_level` at all, so
+// 241 of the 388 cards wearing it were E0 (contributor self-reported). The trust signal on a card is
+// the E-level badge beside this one; a category badge must not overrule it (#3539 H).
 function inferBadge(r) {
   const text = ((r.title||'') + ' ' + (r.summary||'') + ' ' + (r.tags||[]).join(' ')).toLowerCase();
   if (/delete|drop|clear|overwrite|corrupt|destroy|清空|覆盖|丢数据/.test(text)) return { key: 'badgeFatal', cls: 'badge-fatal' };
   if (/timeout|locked|rate.limit|429|403|oom|crash|崩溃|超时|锁定/.test(text)) return { key: 'badgeRuntime', cls: 'badge-runtime' };
   if (/setup|config|install|deploy|初始化|配置|安装/.test(text)) return { key: 'badgeSetup', cls: 'badge-setup' };
-  return { key: 'badgeVerified', cls: 'badge-status' };
+  return { key: 'badgeOther', cls: 'badge-plain' };
 }
 
 // ── Evidence levels (#786) — see docs/trust-semantics.md ──
