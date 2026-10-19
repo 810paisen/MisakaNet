@@ -5619,7 +5619,7 @@ function recordLessonsRead(fields) {
 
 /** Test seams for the isolate state above (exported below, next to the loaders). */
 const lastLessonsReadOf = () => lastLessonsRead;
-const resetLessonsReadState = () => { lastLessonsRead = null; d1ReadCooldownUntil = 0; };
+const resetLessonsReadState = () => { lastLessonsRead = null; d1ReadCooldownUntil = 0; lessonsMemo = null; };
 
 /** Classify a D1 failure for the health payload: `quota` clears at 00:00 UTC, the rest do not. */
 function d1ErrorKind(error) {
@@ -5737,6 +5737,39 @@ function filterSnapshot(lessons, filters) {
   return rows.slice(0, limit);
 }
 
+/**
+ * A per-isolate memo for the unfiltered corpus, and why it exists.
+ *
+ * Measured 2026-10-19 from the Cloudflare dashboard: **6.24M rows read in one day** against the free
+ * plan's 5M, while the site served ~9.4k MCP calls. One search without a durable-cache hit reads the
+ * whole corpus — `INTERNAL_LESSON_LIMIT` is 5000 and the corpus is 516 rows — and 9.4k × 516 ≈ 4.85M,
+ * i.e. the corpus read is the dominant term. The durable cache does not rescue it: its payload is
+ * read *through D1* (`getWithCache` → `readCachePayload`), so a cache hit still bills rows, and once
+ * the quota is gone every request re-reads all 516.
+ *
+ * A Worker isolate serves many requests before it is recycled, so keeping the rows for a few seconds
+ * removes that multiplication without changing what anyone sees: the durable cache's own TTL is 300s,
+ * so 30s of isolate memory cannot serve a corpus older than the cache already would.
+ */
+// Off by default: a cache in module scope outlives a test and hides a corpus change from the next
+// caller in the same process, so tests must opt in explicitly (they never set this). Production sets
+// it in `wrangler.toml` `[vars]`, next to COMMIT_SHA.
+let lessonsMemo = null; // { at: number, rows: Array }
+
+/** The configured memo window in ms; 0 disables the memo entirely. */
+function lessonsMemoTtlMs(env) {
+  const raw = Number(env && env.MISAKANET_LESSONS_MEMO_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 0;
+}
+
+/** Remember the rows this isolate just read, and hand the same array back to the caller. */
+function rememberLessons(rows, env) {
+  if (lessonsMemoTtlMs(env) > 0 && Array.isArray(rows) && rows.length > 0) {
+    lessonsMemo = { at: Date.now(), rows };
+  }
+  return rows;
+}
+
 async function loadLessons(env, filters = {}) {
   // Filtered queries must go to D1 (GitHub proxy can't filter). Unfiltered
   // keeps the D1-first / GitHub fallback behavior, with a KV cache over the
@@ -5771,31 +5804,41 @@ async function loadLessons(env, filters = {}) {
   // that window were unfindable over MCP (a local search over the full corpus found
   // kubernetes-crashloopbackoff-debugging for "kubectl crashloopbackoff" while
   // production answered no_match). The KV cache below keeps this cheap.
+  //
+  // The isolate memo (`LESSONS_MEMO_TTL_MS`) sits in front of that cache, not instead of it: the
+  // cache is a D1 read, so a hit still costs rows, and the row budget is what this path spent 2026-10-19.
+  const memoWindow = lessonsMemoTtlMs(env);
+  const memo = memoWindow > 0 ? lessonsMemo : null;
+  if (memo && Date.now() - memo.at < memoWindow) {
+    recordLessonsRead({ ok: true, source: "memo" });
+    return memo.rows;
+  }
   if (d1Binding(env)) {
     if (Date.now() < d1ReadCooldownUntil) {
       recordLessonsRead({ ok: false, source: "snapshot-cooldown" });
-      return snapshotLessons(env);
+      return rememberLessons(await snapshotLessons(env), env);
     }
     try {
       const fromD1 = await getWithCache(env, "proxy:lessons:d1", () =>
         fetchLessonsFromD1(env, { limit: INTERNAL_LESSON_LIMIT, rich: true }));
       if (fromD1 && fromD1.length > 0) {
         recordLessonsRead({ ok: true, source: "d1" });
-        return fromD1;
+        return rememberLessons(fromD1, env);
       }
     } catch (error) {
       d1ReadCooldownUntil = Date.now() + D1_READ_COOLDOWN_MS;
       logInternal("D1 lesson read failed; serving the data-branch snapshot", error);
       recordLessonsRead({ ok: false, source: "snapshot", error_kind: d1ErrorKind(error) });
-      return snapshotLessons(env);
+      return rememberLessons(await snapshotLessons(env), env);
     }
     // D1 answered but empty — fall back to the GitHub snapshot.
     recordLessonsRead({ ok: true, source: "d1-empty" });
-    return snapshotLessons(env);
+    return rememberLessons(await snapshotLessons(env), env);
   }
   const fromD1 = await fetchLessonsFromD1(env, { limit: INTERNAL_LESSON_LIMIT, rich: true });
-  if (fromD1 && fromD1.length > 0) return fromD1;
-  return getWithCache(env, "proxy:lessons", () => fetchFromGitHub(env.REGISTER_TOKEN, "lessons.json", "data"));
+  if (fromD1 && fromD1.length > 0) return rememberLessons(fromD1, env);
+  return rememberLessons(await getWithCache(env, "proxy:lessons",
+    () => fetchFromGitHub(env.REGISTER_TOKEN, "lessons.json", "data")), env);
 }
 
 // ── D1 question service (PRD ⑤ §9: pull-based answer delivery) ──
@@ -7119,7 +7162,54 @@ async function readFunnelDay(env, day) {
  * the day would redraw the axis instead of reporting it. The route above refuses a series that is
  * *all* zeros — that shape is a store outage wearing a quiet week's clothes.
  */
+/**
+ * One query for the whole window, and the per-day loop only as the fallback.
+ *
+ * Measured 2026-10-19: `/api/activity/history?days=7` issued 7×4 = 28 counters queries and the
+ * funnel series 7 more, each a separate round trip. The window is a contiguous `period` range with a
+ * known `scope`, so it is one `BETWEEN` — the per-day shape is what a fallback should look like, not
+ * what the happy path should cost. `period` is `YYYY-MM-DD`, so lexicographic BETWEEN is date order.
+ *
+ * Any failure falls through to the per-day reader rather than to zeros: that path still has the KV
+ * fallback, and a batch that silently reported 0 for a day it could not read would be the same lie
+ * the whole activity surface is being fixed for.
+ */
+async function readCountersWindow(env, scope, days) {
+  const d1 = d1Binding(env);
+  if (!d1) return null;
+  const from = utcDayKey(days - 1);
+  const to = utcDayKey(0);
+  const { results } = await d1.prepare(
+    `SELECT bucket, period, count FROM counters WHERE scope = ?1 AND period BETWEEN ?2 AND ?3`,
+  ).bind(scope, from, to).all();
+  const byDay = new Map();
+  for (const row of results || []) {
+    if (!byDay.has(row.period)) byDay.set(row.period, new Map());
+    byDay.get(row.period).set(row.bucket, Number(row.count) || 0);
+  }
+  return byDay;
+}
+
 async function readFunnelSeries(env, days) {
+  try {
+    const byDay = await readCountersWindow(env, "funnel", days);
+    if (byDay) {
+      const series = [];
+      for (let i = days - 1; i >= 0; i--) {
+        const date = utcDayKey(i);
+        const day = byDay.get(date);
+        const counts = Object.fromEntries(FUNNEL_EVENTS.map(e => [e, day ? (day.get(e) || 0) : 0]));
+        series.push({ date, ...counts });
+      }
+      // An all-zero window from a batch that returned nothing is the same signal the route refuses
+      // to publish: a reader that cannot see the counters. Fall back to the per-day path (which has
+      // the KV fallback) instead of reporting a quiet week.
+      if (series.every(day => FUNNEL_EVENTS.every(e => day[e] === 0))) throw new Error("empty window");
+      return series;
+    }
+  } catch (error) {
+    logInternal("funnel window read failed; falling back to one query per day", error);
+  }
   const series = [];
   for (let i = days - 1; i >= 0; i--) {
     const date = utcDayKey(i);
@@ -7174,6 +7264,25 @@ function utcDayKey(offsetDays = 0) {
  * wearing a quiet week's clothes.
  */
 async function readActivitySeries(env, days) {
+  // Same batching as the funnel above: one range query instead of days×4 point reads. A day with no
+  // row is a real zero here (the counters are written per day, and a class that served nothing has no
+  // row), which is why the fallback — not this path — is the one that consults KV.
+  try {
+    const byDay = await readCountersWindow(env, "traffic", days);
+    if (byDay) {
+      const series = [];
+      for (let i = days - 1; i >= 0; i--) {
+        const date = utcDayKey(i);
+        const day = byDay.get(date) || new Map();
+        const calls = Object.fromEntries(TRAFFIC_TYPES.map(c => [c, day.get(c) || 0]));
+        series.push({ date, total: TRAFFIC_TYPES.reduce((sum, c) => sum + calls[c], 0), calls });
+      }
+      if (series.every(day => day.total === 0)) throw new Error("empty window");
+      return series;
+    }
+  } catch (error) {
+    logInternal("traffic window read failed; falling back to one day at a time", error);
+  }
   const series = [];
   for (let i = days - 1; i >= 0; i--) {
     const date = utcDayKey(i);
