@@ -7089,16 +7089,27 @@ function noteCountersReadFailure(error, env) {
   logInternal("counters read failed; not querying D1 for counters while cooling down", error);
 }
 
-async function readTrafficCount(env, cls, day) {
+/**
+ * One traffic counter, plus whether its D1 half could be read at all.
+ *
+ * The distinction is the whole point of #3544: `0` means "no calls recorded", `known: false` means
+ * "the store would not answer", and the two must not render the same. KV is added either way —
+ * `bumpCounter` writes its delta there when the D1 upsert fails — so the value is a lower bound when
+ * D1 refused, never a guess.
+ */
+async function readTrafficCountState(env, cls, day) {
   const d1 = d1Binding(env);
   let fromD1 = 0;
-  if (d1 && countersReadable()) {
+  let known = d1 ? false : false;
+  const canAsk = Boolean(d1) && countersReadable();
+  if (canAsk) {
     try {
       const { results } = await d1.prepare(
         `SELECT count FROM counters WHERE scope = ?1 AND bucket = ?2 AND period = ?3`,
       ).bind("traffic", cls, day).all();
       const row = results && results[0];
       fromD1 = row ? Number(row.count) || 0 : 0;
+      known = true;
     } catch (error) {
       noteCountersReadFailure(error, env);
     }
@@ -7107,7 +7118,13 @@ async function readTrafficCount(env, cls, day) {
   // D1 upsert fails, so a day can be split across the two stores. Returning on the first successful
   // D1 row dropped exactly the counts written during an outage — and an outage is the day the panel
   // is most likely to be read.
-  return fromD1 + await readTrafficKv(env, cls, day);
+  const kv = await readTrafficKv(env, cls, day);
+  return { value: fromD1 + kv, known: known || kv > 0 };
+}
+
+/** The count alone, for callers that have nowhere to put "could not read". */
+async function readTrafficCount(env, cls, day) {
+  return (await readTrafficCountState(env, cls, day)).value;
 }
 
 /**
@@ -7133,12 +7150,17 @@ async function readTrafficKv(env, cls, day) {
  */
 async function readTrafficBreakdown(env, day) {
   const entries = await Promise.all(
-    TRAFFIC_TYPES.map(async cls => [cls, await readTrafficCount(env, cls, day)])
+    TRAFFIC_TYPES.map(async cls => [cls, await readTrafficCountState(env, cls, day)])
   );
+  const unreadable = entries.filter(([, state]) => !state.known).map(([cls]) => cls);
   return {
     date: day,
-    breakdown: Object.fromEntries(entries),
-    total: entries.reduce((sum, [, n]) => sum + n, 0),
+    breakdown: Object.fromEntries(entries.map(([cls, state]) => [cls, state.value])),
+    total: entries.reduce((sum, [, state]) => sum + state.value, 0),
+    // Named so a reader can tell "quiet day" from "the store refused": the panel draws the second
+    // one as missing, not as zero (#3544). Absent when everything answered — an empty array is not
+    // a fact worth carrying, and the snapshot's shape stays byte-identical on a healthy day.
+    ...(unreadable.length ? { unreadable } : {}),
   };
 }
 
@@ -7352,7 +7374,11 @@ async function readActivitySeries(env, days) {
   for (let i = days - 1; i >= 0; i--) {
     const date = utcDayKey(i);
     const day = await readTrafficBreakdown(env, date);
-    series.push({ date, total: day.total, calls: day.breakdown });
+    series.push({
+      date, total: day.total, calls: day.breakdown,
+      // Only present when something refused to answer; an empty list is not a fact worth carrying.
+      ...(day.unreadable && day.unreadable.length ? { unreadable: day.unreadable } : {}),
+    });
   }
   return series;
 }
@@ -8463,6 +8489,11 @@ export default {
           date: traffic.date,
           total: traffic.total,
           calls: traffic.breakdown,
+          // #3544: "no calls recorded" and "the store refused" used to render identically. The
+          // count is still served — it is a lower bound — but a reader is told which classes it is
+          // missing, so a bar can be drawn as missing instead of as zero.
+          ...(traffic.unreadable && traffic.unreadable.length
+            ? { unreadable: traffic.unreadable, degraded: true } : {}),
         }, 200, { "Cache-Control": ACTIVITY_CACHE_CONTROL, "X-Robots-Tag": "noindex" });
         if (cache) {
           const putting = cache.put(cacheKey, response.clone()).catch(e =>
@@ -8506,7 +8537,8 @@ export default {
         // A series of zeros is not "a quiet week": this store is hit every time someone searches, so
         // seven zero days is a reader that cannot see the counters. Refusing is the same rule
         // `scripts/sync_site_activity.py` applies to `total: 0` — a failure must not render as data.
-        if (!series.some(day => day.total > 0)) {
+        const anyUnreadable = series.some(day => Array.isArray(day.unreadable) && day.unreadable.length);
+        if (!series.some(day => day.total > 0) && !anyUnreadable) {
           return jsonResponse({
             error: "the counters read as zero for every day in the window",
             code: "counters_unreadable",
