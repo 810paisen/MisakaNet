@@ -3444,18 +3444,66 @@ function escapeLike(text) {
  *
  * Expired rows are filtered out here as well, so a listed key is one `storeGet` would actually return.
  */
+/**
+ * The half-open key range that covers exactly the keys starting with `prefix`.
+ *
+ * Why not `LIKE`: measured 2026-10-20 on production D1, `WHERE key LIKE 'prefix%' ESCAPE '\'`
+ * has no usable plan and reads **every row of `kv_store`** — 68,892 rows for one prefix
+ * listing, against a free-plan budget of 5,000,000 rows read/day. `wrangler d1 insights`
+ * for the six hours to 14:20Z counted 259 such calls and 17,800,700 rows read: 87% of the
+ * account's entire row-read spend, for a listing whose answer is six keys.
+ *
+ * The range (`key >= lo AND key < hi`) uses the primary-key index instead: the same call
+ * reads 6 rows. Two semantics change with it, and both are stated rather than assumed:
+ *
+ *   * `LIKE` is case-insensitive for ASCII; the range is exact. Every key this codebase
+ *     writes is lowercase (`unsolved:lesson:`, `proxy:…`, `keepalive:…`), so the two agree —
+ *     but a key that differed only in case would now be invisible to a listing, which is
+ *     why `storeList`'s contract is "keys that start with this exact prefix", not "keys
+ *     that match this prefix case-insensitively".
+ *   * `LIKE` treats `%` and `_` as wildcards, which `escapeLike` neutralised. The range
+ *     form has no wildcards, so the escaping goes with them — a prefix containing `_` is
+ *     now matched literally, which is what the escaping was for anyway.
+ */
+function prefixRange(prefix) {
+  const lo = String(prefix);
+  const chars = Array.from(lo);
+  // The upper bound is the prefix with its last code point incremented, so every key that
+  // starts with the prefix is below it and every key that does not is above it. A prefix
+  // ending in the maximum code point carries: drop it and increment the one before it.
+  while (chars.length) {
+    const cp = chars[chars.length - 1].codePointAt(0);
+    if (cp < 0x10ffff) {
+      chars[chars.length - 1] = String.fromCodePoint(cp + 1);
+      return { lo, hi: chars.join("") };
+    }
+    chars.pop();
+  }
+  // The prefix was nothing but maximum code points: there is no finite upper bound, so the
+  // caller falls back to the scan rather than to a range that would quietly truncate.
+  return null;
+}
+
 async function storeList(env, prefix, { limit = 1000 } = {}) {
   const names = new Set();
   const d1 = d1Binding(env);
   if (d1) {
     try {
       await ensureKvStoreTable(d1);
-      const { results } = await d1.prepare(
-        `SELECT key FROM kv_store
-          WHERE key LIKE ?1 ESCAPE '\\'
-            AND (expires_at IS NULL OR expires_at > datetime('now'))
-          LIMIT ?2`,
-      ).bind(`${escapeLike(prefix)}%`, limit).all();
+      const range = prefixRange(prefix);
+      const { results } = range
+        ? await d1.prepare(
+          `SELECT key FROM kv_store
+            WHERE key >= ?1 AND key < ?2
+              AND (expires_at IS NULL OR expires_at > datetime('now'))
+            LIMIT ?3`,
+        ).bind(range.lo, range.hi, limit).all()
+        : await d1.prepare(
+          `SELECT key FROM kv_store
+            WHERE key LIKE ?1 ESCAPE '\\'
+              AND (expires_at IS NULL OR expires_at > datetime('now'))
+            LIMIT ?2`,
+        ).bind(`${escapeLike(prefix)}%`, limit).all();
       for (const row of results || []) names.add(String(row.key));
     } catch (error) {
       // Deduplication, not consistency: a failed D1 list still leaves the KV list below.
