@@ -18,6 +18,7 @@ import string
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +32,153 @@ STAGE_SEARCH_THRESHOLD = 3    # 3 次搜索 → active
 STAGE_LESSON_THRESHOLD = 1    # 1 条 lesson → contributor
 
 
+class ProfileLockError(RuntimeError):
+    """The profile lock could not be taken, so the read-modify-write cannot be made safe.
+
+    The counters in profile.json drive stage transitions and referral attribution: a lost
+    increment is a silent correctness bug, so a caller that cannot get the lock is told rather
+    than allowed to write unprotected.
+    """
+
+
+# `msvcrt.locking` only offers a non-blocking mode, so the Windows path polls until this
+# deadline and then raises. POSIX `flock` blocks instead and is unchanged.
+_LOCK_TIMEOUT_SECONDS = 10.0
+_LOCK_POLL_SECONDS = 0.01
+
+# `msvcrt.locking` needs a descriptor opened in binary mode. `os.O_BINARY` only exists on
+# Windows — it is read through `getattr` because on POSIX the attribute genuinely does not
+# exist, and there the flag is not needed.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+
+class _LockBackend:
+    """One platform's exclusive file-lock primitive.
+
+    `acquire` takes the lock, `release` gives it back. Both act on an open file descriptor, and
+    the kernel drops the lock when that descriptor is closed or the process dies — which is why
+    this is a lock on a file and not a lock file created with `O_CREAT|O_EXCL`: a killed process
+    must not be able to leave the profile wedged.
+    """
+
+    def __init__(self, name: str, acquire, release):
+        self.name = name
+        self._acquire = acquire
+        self._release = release
+
+    def acquire(self, fd: int) -> None:
+        self._acquire(fd)
+
+    def release(self, fd: int) -> None:
+        self._release(fd)
+
+
+def _posix_backend(fcntl) -> _LockBackend:
+    """`fcntl.flock` — the POSIX primitive, unchanged.
+
+    A `flock` lock belongs to the open file description, so two threads of one process that open
+    the sidecar separately exclude each other, and the kernel releases the lock when the
+    descriptor is closed or the process dies.
+    """
+
+    def acquire(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+    def release(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+    return _LockBackend("fcntl.flock", acquire, release)
+
+
+def _windows_backend(msvcrt, lock_path: Path) -> _LockBackend:
+    """`msvcrt.locking` — the Windows counterpart of `fcntl.flock`.
+
+    `msvcrt.locking(fd, LK_NBLCK, 1)` reserves one byte of the file for the calling handle and
+    fails immediately when another handle already holds it, so the range is polled until the
+    deadline. Two properties make this the Windows equivalent of `flock`:
+
+    * a byte-range lock belongs to the file handle, so it excludes other threads (each of which
+      opens its own handle) and other processes;
+    * the kernel releases it when the handle is closed or the process dies, so a crash cannot
+      leave the profile wedged.
+
+    `msvcrt` is passed in instead of imported here so that the Windows branch can be exercised
+    on a POSIX machine — see `tests/test_profile_lock.py`.
+    """
+
+    def acquire(fd: int) -> None:
+        _ensure_lock_byte(fd)
+        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+        while True:
+            # `msvcrt.locking` reserves the bytes at the current file position, so the range
+            # has to be named explicitly every time — the offset the previous call left behind
+            # must not decide which bytes are reserved and which are released.
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                return
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise ProfileLockError(
+                        f"could not take the profile lock {lock_path} within "
+                        f"{_LOCK_TIMEOUT_SECONDS:g}s — refusing to update the profile unlocked"
+                    ) from exc
+                time.sleep(_LOCK_POLL_SECONDS)
+
+    def release(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+    return _LockBackend("msvcrt.locking", acquire, release)
+
+
+def _ensure_lock_byte(fd: int) -> None:
+    """Make sure the sidecar has at least one byte to reserve.
+
+    `msvcrt.locking` reserves bytes *of the file* and the sidecar starts empty; reserving a
+    range that does not exist in the file is not portable on Windows, so the first user writes
+    one byte. The write happens before the lock is taken, so two processes racing here write the
+    same byte at the same offset and the sidecar stays one byte long.
+    """
+    if os.fstat(fd).st_size:
+        return
+    os.lseek(fd, 0, os.SEEK_SET)
+    try:
+        os.write(fd, b"\x00")
+    except OSError:
+        # The byte may be reserved already by a process that padded it first; if the file has
+        # content now, there is something to reserve and the lock can still be taken.
+        if not os.fstat(fd).st_size:
+            raise
+
+
+def _import_msvcrt():
+    """Import the Windows CRT module — the seam the tests replace."""
+    import msvcrt
+
+    return msvcrt
+
+
+def _select_lock_backend(lock_path: Path) -> _LockBackend:
+    """Pick this platform's exclusive lock primitive.
+
+    Windows has no `fcntl`, and the first implementation read that as "there is no lock": the
+    read-modify-write ran unprotected on every Windows machine, which is what the CI leg
+    `windows-latest, 3.12` measured — 40 concurrent increments, 39 survived. A platform with
+    neither primitive gets an explicit error instead of an unprotected write.
+    """
+    if sys.platform == "win32":
+        return _windows_backend(_import_msvcrt(), lock_path)
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise ProfileLockError(
+            f"no exclusive file-lock primitive on this platform ({sys.platform}); refusing to "
+            f"update the profile without a lock"
+        ) from exc
+    return _posix_backend(fcntl)
+
+
 @contextmanager
 def _profile_lock():
     """Exclusive lock for the read-modify-write of profile.json (#1775).
@@ -40,22 +188,22 @@ def _profile_lock():
     vanishes; the counters drive stage transitions and referral attribution, so that is a silent
     correctness bug. A sidecar lock file is used rather than the profile itself because `_save`
     replaces the inode on every write (`os.replace`), which would drop a lock held on the old one.
-    `flock` is auto-released if the process dies, so a crash cannot leave the profile wedged.
+
+    The lock is real on every platform: `fcntl.flock` on POSIX, `msvcrt.locking` on Windows.
+    Both are owned by the open descriptor and are released by the kernel when the process dies,
+    so a crash cannot leave the profile wedged. A lock that cannot be taken at all is a
+    `ProfileLockError`, never an unprotected write.
     """
     PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     lock_path = PROFILE_PATH.parent / ".profile.lock"
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    backend = _select_lock_backend(lock_path)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | _O_BINARY, 0o600)
     try:
-        try:
-            import fcntl
-        except ImportError:  # non-POSIX: best-effort, still atomic-rename on save
-            yield
-            return
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        backend.acquire(fd)
         try:
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            backend.release(fd)
     finally:
         os.close(fd)
 
