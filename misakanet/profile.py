@@ -47,9 +47,7 @@ _LOCK_TIMEOUT_SECONDS = 10.0
 _LOCK_POLL_SECONDS = 0.01
 
 # `msvcrt.locking` needs a descriptor opened in binary mode. `os.O_BINARY` only exists on
-# Windows — it is read through `getattr` because on POSIX the attribute genuinely does not
-# exist, and there the flag is not needed.
-_O_BINARY = getattr(os, "O_BINARY", 0)
+# Windows, so it is read on the Windows path only — see `_windows_primitives`.
 
 
 class _LockBackend:
@@ -61,10 +59,14 @@ class _LockBackend:
     must not be able to leave the profile wedged.
     """
 
-    def __init__(self, name: str, acquire, release):
+    def __init__(self, name: str, acquire, release, open_flags: int = 0):
         self.name = name
         self._acquire = acquire
         self._release = release
+        # Flags this platform needs on the lock file's descriptor. `msvcrt.locking` needs the
+        # descriptor opened in binary mode, and `os.O_BINARY` only exists on Windows — so the
+        # backend carries the flag rather than the caller guessing it with `getattr`.
+        self.open_flags = open_flags
 
     def acquire(self, fd: int) -> None:
         self._acquire(fd)
@@ -90,7 +92,7 @@ def _posix_backend(fcntl) -> _LockBackend:
     return _LockBackend("fcntl.flock", acquire, release)
 
 
-def _windows_backend(msvcrt, lock_path: Path) -> _LockBackend:
+def _windows_backend(msvcrt, lock_path: Path, open_flags: int = 0) -> _LockBackend:
     """`msvcrt.locking` — the Windows counterpart of `fcntl.flock`.
 
     `msvcrt.locking(fd, LK_NBLCK, 1)` reserves one byte of the file for the calling handle and
@@ -129,7 +131,7 @@ def _windows_backend(msvcrt, lock_path: Path) -> _LockBackend:
         os.lseek(fd, 0, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
-    return _LockBackend("msvcrt.locking", acquire, release)
+    return _LockBackend("msvcrt.locking", acquire, release, open_flags=open_flags)
 
 
 def _ensure_lock_byte(fd: int) -> None:
@@ -152,11 +154,18 @@ def _ensure_lock_byte(fd: int) -> None:
             raise
 
 
-def _import_msvcrt():
-    """Import the Windows CRT module — the seam the tests replace."""
+def _windows_primitives():
+    """The Windows lock primitives — the seam the tests replace.
+
+    Two things are Windows-only: the `msvcrt` module and the `os.O_BINARY` flag that
+    `msvcrt.locking` needs on the descriptor it locks. They are read together, here, on the one
+    path that only runs on Windows — so `os.O_BINARY` is a direct attribute access rather than a
+    `getattr` guess, and a test that simulates Windows on another platform can replace the whole
+    pair in one move.
+    """
     import msvcrt
 
-    return msvcrt
+    return msvcrt, os.O_BINARY
 
 
 def _select_lock_backend(lock_path: Path) -> _LockBackend:
@@ -168,7 +177,8 @@ def _select_lock_backend(lock_path: Path) -> _LockBackend:
     neither primitive gets an explicit error instead of an unprotected write.
     """
     if sys.platform == "win32":
-        return _windows_backend(_import_msvcrt(), lock_path)
+        msvcrt, open_flags = _windows_primitives()
+        return _windows_backend(msvcrt, lock_path, open_flags)
     try:
         import fcntl
     except ImportError as exc:
@@ -197,7 +207,7 @@ def _profile_lock():
     PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     lock_path = PROFILE_PATH.parent / ".profile.lock"
     backend = _select_lock_backend(lock_path)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | _O_BINARY, 0o600)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | backend.open_flags, 0o600)
     try:
         backend.acquire(fd)
         try:

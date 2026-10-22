@@ -8,7 +8,7 @@ branch, and the read-modify-write ran with **no lock at all**. The CI leg `windo
 measured the consequence: 40 concurrent increments, 39 survived.
 
 This machine is POSIX, so the Windows branch cannot be *executed* here. It is still checked: the
-platform-specific primitive sits behind a seam (`_import_msvcrt()` / `_windows_backend()`) and is
+platform-specific primitive sits behind a seam (`_windows_primitives()` / `_windows_backend()`) and is
 exercised below with a stand-in for the Windows CRT module that reproduces the one behaviour the
 implementation depends on — `LK_NBLCK` reserves a byte range for the calling handle and fails
 immediately when another handle already holds it.
@@ -69,9 +69,14 @@ class FakeMsvcrt:
 
 @pytest.fixture
 def fake_msvcrt(monkeypatch) -> FakeMsvcrt:
-    """Put the Windows CRT stand-in behind the module's import seam."""
+    """Put the Windows CRT stand-in behind the module's import seam.
+
+    The seam hands over both Windows-only primitives — the `msvcrt` module and the
+    `os.O_BINARY` flag — so a test that simulates Windows on another platform replaces the pair
+    in one move, and the module never has to guess the flag with `getattr`.
+    """
     fake = FakeMsvcrt()
-    monkeypatch.setattr(profile_mod, "_import_msvcrt", lambda: fake)
+    monkeypatch.setattr(profile_mod, "_windows_primitives", lambda: (fake, 0))
     return fake
 
 
@@ -156,7 +161,7 @@ def test_the_windows_branch_fails_fast_when_the_lock_cannot_be_taken(
             super().locking(fd, mode, nbytes)
             raise OSError(13, "Permission denied")
 
-    monkeypatch.setattr(profile_mod, "_import_msvcrt", lambda: Refuses())
+    monkeypatch.setattr(profile_mod, "_windows_primitives", lambda: (Refuses(), 0))
     monkeypatch.setattr(profile_mod, "_LOCK_TIMEOUT_SECONDS", 0.2)
     monkeypatch.setattr(profile_mod, "_LOCK_POLL_SECONDS", 0.01)
     monkeypatch.setattr(profile_mod, "PROFILE_PATH", tmp_path / "profile.json")
