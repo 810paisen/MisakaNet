@@ -178,7 +178,12 @@ test('a handler whose program path contains a space is dispatched', async (t) =>
   // exist, so the handler never ran and nothing said why.
   const tmp = await makeTmpDir('fatal-guard-spaced-');
   try {
-    const spaced = path.join(tmp, 'node copy');
+    // The copy keeps the original's extension. Windows resolves a program name
+    // without an extension by appending ".exe" (libuv does it, and so does
+    // CreateProcess), so "node copy" would be looked for as "node copy.exe" —
+    // a spawn error with no useful message. The extension is part of the
+    // program's name on Windows, not decoration.
+    const spaced = path.join(tmp, `node copy${path.extname(process.execPath)}`);
     let linked = false;
     for (const method of ['linkSync', 'symlinkSync']) {
       try {
@@ -188,7 +193,15 @@ test('a handler whose program path contains a space is dispatched', async (t) =>
       } catch (_) { /* try the next way */ }
     }
     if (!linked) {
-      t.skip('this filesystem cannot link the node executable (no hard link, no symlink)');
+      // No hard link (a different volume) and no symlink (Windows wants a
+      // privilege for that). A copy always works; it costs a node binary.
+      try {
+        fs.copyFileSync(process.execPath, spaced);
+        linked = true;
+      } catch (_) { /* the filesystem refuses both */ }
+    }
+    if (!linked) {
+      t.skip('this filesystem cannot provide a second copy of the node executable');
       return;
     }
 

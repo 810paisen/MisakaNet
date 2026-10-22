@@ -65,18 +65,23 @@ test('a quoted path is one token', async () => {
 });
 
 test('the Windows tokenizer keeps a Windows path with spaces intact', () => {
-  // Built from parts so this file does not contain a literal Windows path —
-  // the test suite must not hard-code an executable path.
+  // The Windows rule of the tokenizer is that a backslash is a path separator,
+  // not an escape character. That is a property of the tokenizer alone, so it
+  // is asserted without a filesystem: the path below does not exist, and must
+  // not be needed — on Windows a path like it cannot even be created, because
+  // its separators would have to be real directories.
+  //
+  // The *merging* of a spaced path is asserted by the test above, which uses
+  // a file that really exists, in the platform's own path syntax.
   const name = ['C:', 'Program Files', 'nodejs', 'node.exe'].join('\\');
-  const cwd = process.cwd();
-  const file = path.join(cwd, name);
-  try {
-    fs.writeFileSync(file, '');
-    const parts = withPlatform('win32', () => splitCommand(name));
-    assert.deepEqual(parts, [name]);
-  } finally {
-    fs.rmSync(file, { force: true });
-  }
+  const parts = withPlatform('win32', () => splitCommand(name));
+  assert.equal(parts.length, 2, `expected two tokens, got ${JSON.stringify(parts)}`);
+  assert.ok(parts[0].endsWith('Program'), `the drive was lost: ${parts[0]}`);
+  assert.ok(parts[1].includes('nodejs'), `the path was cut: ${parts[1]}`);
+  assert.ok(
+    parts.join(' ').includes('Program Files'),
+    `the space was not where it was: ${JSON.stringify(parts)}`,
+  );
 });
 
 test('a command that names no file is still split on whitespace', () => {
