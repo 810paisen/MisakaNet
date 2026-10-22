@@ -1475,7 +1475,10 @@ def failed_scoped_pages(report: dict[str, Any]) -> list[str]:
 
 def print_scoped_report(report: dict[str, Any], verbose: bool = False) -> None:
     pages = report["pages"]
-    print(f"{'page':<34} {'viewport':<10} {'changed px':>12} {'allowed':>10} {'outside':>10}  verdict")
+    print(
+        f"{'page':<34} {'viewport':<10} {'changed px':>12} {'allowed':>10} "
+        f"{'outside':>10}  verdict"
+    )
     print("-" * 92)
     for pid in sorted(pages):
         for viewport in [v[0] for v in VIEWPORTS]:
