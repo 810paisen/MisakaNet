@@ -1311,6 +1311,203 @@ def print_noise_floor(report: dict[str, Any]) -> None:
         )
 
 
+# ── the scoped criterion: "only what was supposed to change, changed" ──────────────────────────
+#
+# `compare` answers **how much** changed. That is the right question for a change that is not
+# supposed to change the layout, and the wrong question for one that is: a deliberate reorder
+# moves a whole page, and no threshold can say "that was the part you were allowed to move".
+#
+# The scoped criterion asks **where**. The author declares the regions whose changes are intended
+# — the section that moved, the block that became a line — and the gate asserts that **no pixel
+# outside those regions changed**. A change that is bigger than intended inside a declared region
+# is still accepted (the region is the unit of permission, not the pixel), and a change that is
+# small but somewhere else is still a failure: that is the stray edit nobody meant to make.
+#
+# The boxes are read off the `compare --verbose` report, which prints the bounding box of every
+# region it found. The workflow is therefore: look at what changed, decide which of those regions
+# are the intended change, declare them, and let the gate prove that nothing else moved.
+
+#: An allowed region: `page[@viewport]:x0,y0,x1,y1`.
+_ALLOW_RE = re.compile(
+    r"^(?P<page>[A-Za-z0-9._-]+)(?:@(?P<viewport>[A-Za-z0-9]+))?"
+    r":(?P<x0>\d+),(?P<y0>\d+),(?P<x1>\d+),(?P<y1>\d+)$"
+)
+
+
+def parse_allow_region(text: str) -> tuple[str, str | None, tuple[int, int, int, int]]:
+    """`index@1280x800:0,1900,1280,2400` → ("index", "1280x800", (0, 1900, 1280, 2400)).
+
+    The viewport is optional: without it the region applies to every viewport of that page, which
+    is the right default for a section that exists at every width.
+    """
+    match = _ALLOW_RE.match(text.strip())
+    if not match:
+        raise ValueError(
+            f"cannot read the allowed region {text!r}; expected page[@viewport]:x0,y0,x1,y1"
+        )
+    x0, y0, x1, y1 = (int(match.group(key)) for key in ("x0", "y0", "x1", "y1"))
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError(f"the allowed region {text!r} is empty")
+    return match.group("page"), match.group("viewport"), (x0, y0, x1, y1)
+
+
+def scoped_check(
+    before: Any,
+    after: Any,
+    allowed_boxes: list[tuple[int, int, int, int]] | None = None,
+    tolerance: int = DEFAULT_TOLERANCE,
+    block: int = 8,
+) -> dict[str, Any]:
+    """Which changed pixels fall **outside** the declared boxes.
+
+    The difference from `compare_arrays` is what the verdict is made of. `compare` asks *how much*
+    changed; this asks *where*. A page with no declared region must not change at all, which is
+    the same rule `compare` applies, so a page that nobody touched needs no permission.
+
+    Rows and columns that exist on one side only count as changed: content appeared or vanished
+    there, and comparing pixels would not see it, because there is no pixel on the other side.
+    The whole band counts, not just the part of it that is a different colour — a page that grew
+    by forty blank rows has changed, even though no pixel changed hue. The result keeps the two
+    apart: `recoloured_pixels` is the colour difference, `grown_pixels` is the rest.
+    """
+    np = _np()
+    boxes = list(allowed_boxes or [])
+    height = max(int(before.shape[0]), int(after.shape[0]))
+    width = max(int(before.shape[1]), int(after.shape[1]))
+    overlap_h = min(int(before.shape[0]), int(after.shape[0]))
+    overlap_w = min(int(before.shape[1]), int(after.shape[1]))
+
+    changed = np.zeros((height, width), dtype=bool)
+    recoloured = np.zeros((height, width), dtype=bool)
+    if overlap_h and overlap_w:
+        difference = np.abs(
+            before[:overlap_h, :overlap_w] - after[:overlap_h, :overlap_w]
+        ).max(axis=2)
+        recoloured[:overlap_h, :overlap_w] = difference > tolerance
+        changed[:overlap_h, :overlap_w] = recoloured[:overlap_h, :overlap_w]
+    if overlap_h < height:
+        changed[overlap_h:, :] = True
+    if overlap_w < width:
+        changed[:, overlap_w:] = True
+
+    allowed = np.zeros((height, width), dtype=bool)
+    for x0, y0, x1, y1 in boxes:
+        allowed[max(0, y0):min(height, y1), max(0, x0):min(width, x1)] = True
+    outside = changed & ~allowed
+    outside_regions = _regions(outside, block)
+    changed_pixels = int(changed.sum())
+    outside_pixels = int(outside.sum())
+    return {
+        "before_size": [int(before.shape[1]), int(before.shape[0])],
+        "after_size": [int(after.shape[1]), int(after.shape[0])],
+        "size_changed": bool(before.shape != after.shape),
+        "tolerance": tolerance,
+        "allowed_boxes": [list(box) for box in boxes],
+        "changed_pixels": changed_pixels,
+        "recoloured_pixels": int(recoloured.sum()),
+        "grown_pixels": changed_pixels - int(recoloured.sum()),
+        "allowed_pixels": changed_pixels - outside_pixels,
+        "outside_pixels": outside_pixels,
+        "outside_regions": outside_regions,
+        "ok": outside_pixels == 0,
+    }
+
+
+def scoped_compare(
+    before_dir: Path,
+    after_dir: Path,
+    allow: list[tuple[str, str | None, tuple[int, int, int, int]]] | None = None,
+    tolerance: int = DEFAULT_TOLERANCE,
+    only: list[str] | None = None,
+    block: int = 8,
+) -> dict[str, Any]:
+    """Compare two capture directories under the scoped criterion.
+
+    `allow` is the list of declared regions: (page, viewport or None, box). A region declared
+    without a viewport applies to every viewport of that page.
+    """
+    allow = list(allow or [])
+    before_files = {p.name: p for p in before_dir.glob("*.png")}
+    after_files = {p.name: p for p in after_dir.glob("*.png")}
+    pages: dict[str, dict[str, Any]] = {}
+    missing: list[dict[str, str]] = []
+
+    for name in sorted(set(before_files) | set(after_files)):
+        parsed = parse_image_name(name)
+        if parsed is None:
+            continue
+        pid, viewport = parsed
+        if only and pid not in set(only):
+            continue
+        if name not in before_files:
+            missing.append({"page": pid, "viewport": viewport, "problem": "missing in before"})
+            continue
+        if name not in after_files:
+            missing.append({"page": pid, "viewport": viewport, "problem": "missing in after"})
+            continue
+        boxes = [
+            box
+            for page, vp, box in allow
+            if page == pid and (vp is None or vp == viewport)
+        ]
+        pair = scoped_check(
+            _load_rgb(before_files[name]),
+            _load_rgb(after_files[name]),
+            boxes,
+            tolerance=tolerance,
+            block=block,
+        )
+        pages.setdefault(pid, {})[viewport] = pair
+
+    return {"pages": pages, "missing": missing, "tolerance": tolerance}
+
+
+def failed_scoped_pages(report: dict[str, Any]) -> list[str]:
+    """The pages that changed something they were not allowed to change."""
+    failed = [
+        pid
+        for pid, viewports in report["pages"].items()
+        if any(not pair["ok"] for pair in viewports.values())
+    ]
+    failed.extend(sorted({m["page"] for m in report["missing"]}))
+    return sorted(set(failed))
+
+
+def print_scoped_report(report: dict[str, Any], verbose: bool = False) -> None:
+    pages = report["pages"]
+    print(f"{'page':<34} {'viewport':<10} {'changed px':>12} {'allowed':>10} {'outside':>10}  verdict")
+    print("-" * 92)
+    for pid in sorted(pages):
+        for viewport in [v[0] for v in VIEWPORTS]:
+            pair = pages[pid].get(viewport)
+            if pair is None:
+                continue
+            flag = "ok" if pair["ok"] else "OUTSIDE"
+            print(
+                f"{pid:<34} {viewport:<10} {pair['changed_pixels']:>12,} "
+                f"{pair['allowed_pixels']:>10,} {pair['outside_pixels']:>10,}  {flag}"
+            )
+            if pair["size_changed"]:
+                print(
+                    f"{'':<34} └─ page size changed: "
+                    f"{pair['before_size'][0]}×{pair['before_size'][1]} → "
+                    f"{pair['after_size'][0]}×{pair['after_size'][1]}"
+                )
+            if verbose:
+                for box in pair["allowed_boxes"]:
+                    print(f"{'':<34}    allowed region {box}")
+                for region in pair["outside_regions"]:
+                    x0, y0, x1, y1 = region["bbox"]
+                    print(
+                        f"{'':<34}    OUTSIDE region {region['bbox']} "
+                        f"({x1 - x0}×{y1 - y0}) {region['diff_pixels']:,} px"
+                    )
+    if report["missing"]:
+        print("\nmissing captures:")
+        for item in report["missing"]:
+            print(f"  {item['page']} @{item['viewport']}: {item['problem']}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The command line, built separately from `main` so the defaults can be pinned by a test."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -1409,6 +1606,33 @@ def build_parser() -> argparse.ArgumentParser:
     floor.add_argument("--pages", nargs="*", default=None, help=argparse.SUPPRESS)
     floor.add_argument("--json", type=Path, default=None, help="write the measurement here")
 
+    scoped = sub.add_parser(
+        "scoped",
+        help="the scoped criterion: only the declared regions may change",
+    )
+    scoped.add_argument("--before", type=Path, required=True)
+    scoped.add_argument("--after", type=Path, required=True)
+    scoped.add_argument(
+        "--allow",
+        action="append",
+        default=None,
+        metavar="PAGE[@VIEWPORT]:X0,Y0,X1,Y1",
+        help=(
+            "a region whose changes are allowed, in image coordinates "
+            "(repeatable; the boxes come from the compare --verbose report)"
+        ),
+    )
+    scoped.add_argument(
+        "--tolerance",
+        type=int,
+        default=DEFAULT_TOLERANCE,
+        help=f"channel difference that counts as noise (default {DEFAULT_TOLERANCE})",
+    )
+    scoped.add_argument("--block", type=int, default=8, help=argparse.SUPPRESS)
+    scoped.add_argument("--pages", nargs="*", default=None, help=argparse.SUPPRESS)
+    scoped.add_argument("--json", type=Path, default=None, help="write the full report here")
+    scoped.add_argument("--verbose", "-v", action="store_true", help="print every region")
+
     return parser
 
 
@@ -1479,6 +1703,36 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"\njson: {args.json}")
         return 0 if measurement["silent"] else 1
+
+    if args.command == "scoped":
+        try:
+            allow = [parse_allow_region(text) for text in (args.allow or [])]
+        except ValueError as exc:
+            print(f"compare_site_pixels: {exc}", file=sys.stderr)
+            return 2
+        report = scoped_compare(
+            args.before,
+            args.after,
+            allow=allow,
+            tolerance=args.tolerance,
+            only=args.pages,
+            block=args.block,
+        )
+        print_scoped_report(report, verbose=args.verbose)
+        if args.json:
+            args.json.write_text(
+                json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            print(f"\njson: {args.json}")
+        failed = failed_scoped_pages(report)
+        if failed:
+            print(
+                f"\nFAIL: {len(failed)} page(s) changed outside their allowed regions: "
+                f"{', '.join(failed)}"
+            )
+            return 1
+        print("\nPASS: every change is inside a declared region")
+        return 0
 
     report = compare(
         args.before,
