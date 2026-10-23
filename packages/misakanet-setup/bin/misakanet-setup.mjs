@@ -114,7 +114,7 @@ const SILENT = has('--silent');
 const REPORT_JSON = has('--report-json');
 const HOME = resolve(valueOf('--home', homedir()));
 const AGENTS = ['claude', 'codex', 'hermes', 'openclaw', 'codewhale',
-                'cursor', 'gemini', 'copilot', 'opencode', 'kiro'];
+                'cursor', 'gemini', 'copilot', 'opencode', 'kiro', 'mcode'];
 
 const done = [];
 const manual = [];
@@ -443,7 +443,62 @@ const AGENT_LABELS = {
   openclaw: 'OpenClaw',
   codewhale: 'Codewhale',
   ...Object.fromEntries(Object.entries(MCP_ONLY_TARGETS).map(([id, spec]) => [id, spec.label])),
+  // Not an MCP-only target: it takes a rules block too (see `installMcode`), so its label cannot be
+  // read from that table.
+  mcode: 'MiniMax Code',
 };
+
+/**
+ * MiniMax Code (`mcode`) — a **plugin directory**, not a config file (issue #3777).
+ *
+ * Three facts decide this whole target, and none of them is guessable from the other clients:
+ *
+ *   * mcode does not read a user-level MCP config. `~/.minimax/config.yaml`'s `mcpServers` is
+ *     ignored (measured in #3777), so writing an entry there would look installed and register
+ *     nothing.
+ *   * It *does* read a **plugin directory** whose manifest is a Claude Code plugin manifest:
+ *     `~/.minimax/plugins/misakanet/.claude-plugin/plugin.json` (source `LOCAL_CLAUDE`) makes
+ *     `mcode plugin list` show `misakanet@local enabled`. Placing the directory is the install.
+ *   * `mcode plugin add misakanet@local` answers `LOCAL_PLUGIN_INSTALL_UNSUPPORTED` — that is its
+ *     refusal to *link* a local plugin, not evidence that the plugin is missing: the listing still
+ *     shows it enabled while the directory is in place. Nothing in this installer runs that command.
+ *
+ * The manifest cannot be copied from the repository's own `.claude-plugin/plugin.json`: the npm
+ * package's `files` list does not ship it (`bin/`, `hook/`, `voice/`, `README.md` only), so the
+ * expected shape is built here. Rules are ordinary `AGENTS.md`: `~/.minimax/AGENTS.md` is its
+ * global scope and applies to every session. There is no hook mechanism, so tier ③ does not exist
+ * for this target and the install says so instead of implying behaviour changed.
+ *
+ * What this target cannot fix: mcode budgets ~2000 ms for HTTP MCP discovery and Node's `fetch`
+ * ignores proxy variables unless `NODE_USE_ENV_PROXY=1`. On a proxied machine the result is
+ * "installed but 0 tools" — a runtime fact, documented in docs/integrations/mcode.md, not
+ * something an installer can write around.
+ */
+const MCODE_PLUGIN_REL = join('.minimax', 'plugins', 'misakanet', '.claude-plugin', 'plugin.json');
+const MCODE_RULES_REL = join('.minimax', 'AGENTS.md');
+const MCODE_DESCRIPTION = 'MisakaNet failure memory: search evidence-rated failure lessons before '
+  + 're-debugging, and turn new failures into shared knowledge.';
+
+const mcodePluginPath = (home) => join(home, MCODE_PLUGIN_REL);
+
+/** The manifest we write — the shape `mcode plugin list` reads. */
+function mcodePluginDoc(bearer) {
+  return {
+    name: 'misakanet',
+    version: VERSION,
+    description: MCODE_DESCRIPTION,
+    mcpServers: {
+      misakanet: { type: 'http', url: ENDPOINT, headers: mcpHeaders(bearer, 'mcode') },
+    },
+  };
+}
+
+/** The `misakanet` entry in that manifest, or null when the file is absent or not JSON. */
+function mcodePluginEntry() {
+  const doc = readJson(mcodePluginPath(HOME), null);
+  return doc && typeof doc === 'object' ? doc.mcpServers?.misakanet || null : null;
+}
+
 
 /** The supported assistants, named from `AGENTS` — never a hand-written second list. */
 function supportedAgentLabels() {
@@ -466,6 +521,10 @@ const AGENT_WRITE_PATHS = {
   // for the write manifest, the detection paths and the report's scope line.
   ...Object.fromEntries(Object.entries(MCP_ONLY_TARGETS)
     .map(([id, spec]) => [id, (home) => [spec.config(home)]])),
+  // Two files, two tiers: the plugin manifest registers the endpoint (①) and the global AGENTS.md
+  // carries the rules block (②). Listing both here is what makes the preview, `--list-writes` and
+  // the permission pre-check agree with `installMcode`.
+  mcode: (home) => [join(home, MCODE_PLUGIN_REL), join(home, MCODE_RULES_REL)],
   openclaw: () => openclawWorkspaces().map((workspace) => join(workspace, 'AGENTS.md')),
 };
 
@@ -1414,6 +1473,11 @@ function mcpEntryPresent(agent) {
     codewhale: () => readText(join(HOME, '.codewhale', 'mcp.json')),
     ...Object.fromEntries(Object.entries(MCP_ONLY_TARGETS)
       .map(([id, spec]) => [id, () => readText(spec.config(HOME))])),
+    // The manifest *is* the registry here, and the URL is part of the answer: a plugin pointing at
+    // a dead mirror is not "registered" for the question this function asks (`install-scope`).
+    mcode: () => (mcpEntryState(mcodePluginEntry(), 'url').state === 'ok'
+      ? readText(mcodePluginPath(HOME))
+      : ''),
   }[agent]?.() || '';
   return text.includes('misakanet') && text !== 'null';
 }
@@ -1426,6 +1490,9 @@ function detect(agent) {
     openclaw: ['.openclaw'],
     codewhale: ['.codewhale'],
     ...Object.fromEntries(Object.entries(MCP_ONLY_TARGETS).map(([id, spec]) => [id, spec.detect])),
+    // Both names are in circulation: `~/.minimax` is the current one, `~/.minimax-code` the older
+    // directory some installs still have (issue #3777). Either is evidence the CLI was here.
+    mcode: ['.minimax', '.minimax-code'],
   }[agent] || [];
   return paths.some((p) => existsSync(join(HOME, p)));
 }
@@ -2021,6 +2088,65 @@ async function installMcpOnly(agent, bearer) {
   need(`${spec.label}：${spec.manual}`);
 }
 
+/**
+ * MiniMax Code: write the plugin manifest, then the rules block in its global `AGENTS.md`.
+ *
+ * Two rules from the comment on `MCODE_PLUGIN_REL` drive the whole function:
+ *
+ *   * **the file may not be ours.** A plugin directory is a user-owned space, so an existing
+ *     manifest with a different `name` (or one that is not JSON) is *preserved* and reported as a
+ *     manual step — overwriting it would delete someone else's plugin to install ours.
+ *   * **`--mcp-only` is tier ①.** The manifest is the endpoint registration; `~/.minimax/AGENTS.md`
+ *     is a rules block (②), so it is skipped there — the same split every other target follows.
+ *
+ * Idempotent through `sameJson` (an editor that reorders keys is not a change) and through
+ * `adoptExistingClientId`, so a re-run without `--client-id` keeps the header the file already
+ * declares (#3772).
+ */
+async function installMcode(bearer) {
+  const plugin = mcodePluginPath(HOME);
+  const existing = readText(plugin);
+  // Before building the entry: a re-run must declare the id this manifest already carries.
+  if (existing) adoptExistingClientId(existing);
+  const wanted = mcodePluginDoc(bearer);
+
+  if (!existing) {
+    writeText(plugin, `${JSON.stringify(wanted, null, 2)}\n`);
+    ok(`MiniMax Code：写入插件清单 → ${plugin}`);
+  } else {
+    const current = readJson(plugin, null);
+    if (current === null) {
+      need(`MiniMax Code：${plugin} 不是合法 JSON → 已原样保留；请手动修正或删掉它，再重跑本命令`);
+      return;
+    }
+    if (current?.name !== 'misakanet') {
+      need(`MiniMax Code：${plugin} 已存在且不是本安装器写的（name=${JSON.stringify(current?.name ?? null)}）`
+        + ' → 已原样保留；要装 MisakaNet 请先把这个插件目录移走，再重跑本命令');
+      return;
+    }
+    if (sameJson(current, wanted)) {
+      ok('MiniMax Code：插件清单已是目标内容（无改动）');
+    } else {
+      backup(plugin);
+      writeText(plugin, `${JSON.stringify(wanted, null, 2)}\n`);
+      ok(`MiniMax Code：更新插件清单 → ${plugin}`);
+    }
+  }
+
+  const rules = join(HOME, MCODE_RULES_REL);
+  if (!MCP_ONLY) ok(`MiniMax Code：规则块 ${injectBlock(rules, PROMPT_BLOCK)} → ${rules}`);
+  else skip('MiniMax Code：规则块未写（--mcp-only：只放插件清单）');
+
+  // Said out loud for the same reason Cursor's and Gemini's layers are: an install that looks
+  // complete and has no behaviour layer is the failure this installer refuses to hide.
+  skip('MiniMax Code：没有 Claude Code 那种钩子（mcode 没有 hook 机制）'
+    + ' → 规则块在 ~/.minimax/AGENTS.md（每个会话生效），自动沉淀那一步做不到');
+  need('MiniMax Code：重启后跑 `mcode plugin list` 复核（应显示 misakanet@local enabled）；'
+    + '公司代理下还要设 NODE_USE_ENV_PROXY=1 —— 它的 HTTP MCP 发现预算约 2000ms，'
+    + '不设会表现为"装上了但 0 个工具"（`mcode plugin add` 报 LOCAL_PLUGIN_INSTALL_UNSUPPORTED '
+    + '不是失败，插件目录在位即为生效）');
+}
+
 // The last endpoint probe, recorded so `--report` can print it without probing twice.
 let lastProbe = { reachable: false, tools: 0, note: '' };
 
@@ -2134,7 +2260,7 @@ async function verify() {
   // `install: complete` / `verify: READY` were reported for an untouched home — the exact
   // self-contradiction the issue was filed for (`detected-agents: []` next to
   // `install-complete: complete`). Judged on "no target in AGENTS is detected", not on one
-  // hard-coded directory: any of the ten supported assistants counts.
+  // hard-coded directory: any of the supported assistants in `AGENTS` counts.
   const detectedAgents = AGENTS.filter((agent) => detect(agent));
   if (!detectedAgents.length) {
     installFailed();
@@ -2372,6 +2498,47 @@ async function verify() {
       }
     }
   }
+  // MiniMax Code: a plugin directory + a rules file, so "installed" is two facts and both are
+  // checked. The manifest has to be valid JSON with our entry at the right URL; a file that a
+  // hand-edit turned into `{}` is exactly the state a re-run fixes. `mcode plugin add` refuses
+  // local plugins on purpose (LOCAL_PLUGIN_INSTALL_UNSUPPORTED), so its exit code is not evidence
+  // either way — the directory is, and that is what this reads.
+  if (detect('mcode')) {
+    const rules = join(HOME, MCODE_RULES_REL);
+    if (!readText(rules).includes(`<!-- ${START} -->`)) {
+      installFailed();
+      need(canCreateHere(rules)
+        ? `MiniMax Code：规则块没装（${rules}）→ 重跑安装命令`
+        : `MiniMax Code：规则块装不了（${rules}）→ ${unwritableAdvice()}`);
+    } else {
+      ok('MiniMax Code：规则块已装');
+    }
+    const plugin = mcodePluginPath(HOME);
+    const doc = readJson(plugin, null);
+    if (doc === null) {
+      installFailed();
+      need(canCreateHere(plugin)
+        ? `MiniMax Code：插件清单缺失或不是合法 JSON（${plugin}）→ 重跑安装命令`
+        : `MiniMax Code：插件清单装不了（${plugin}）→ ${unwritableAdvice()}`);
+    } else {
+      const verdict = mcpEntryState(doc.mcpServers?.misakanet, 'url');
+      if (verdict.state === 'missing') {
+        installFailed();
+        need(`MiniMax Code：插件清单里没有 mcpServers.misakanet（${plugin}）→ 重跑安装命令`);
+      } else if (verdict.state === 'no-url-field') {
+        installFailed();
+        need(`MiniMax Code：插件清单里的条目没有 url 字段（${plugin}）→ 重跑安装命令`);
+      } else if (verdict.state === 'wrong-url') {
+        installFailed();
+        need(`MiniMax Code：插件清单指向的端点不对（${verdict.url}，应为 ${verdict.expected}）（${plugin}）`
+          + '→ 重跑安装命令');
+      } else {
+        ok(`MiniMax Code：插件清单已注册（${verdict.url}）`);
+        skip('MiniMax Code：只能确认"插件目录在位"，无法确认 mcode 是否已加载 → 跑 `mcode plugin list` 复核'
+          + '（`mcode plugin add` 报 LOCAL_PLUGIN_INSTALL_UNSUPPORTED 不是失败）');
+      }
+    }
+  }
   // Version: what is installed, and whether the registry has moved on. Read-only here — the
   // hook owns the periodic nudge (it cannot be a network call in this process's hot path), and
   // `--verify` is an explicit user action, so one lookup is both cheap and expected.
@@ -2401,7 +2568,7 @@ async function verify() {
     // `true` only for the probe answers that are not a verdict about the machine (timeout, and a
     // proxy this Node cannot use). It is what turns the exit code from 1 into 2 (#3778).
     unverified: probeState === 'unverified',
-    // A home with none of the ten targets: distinct from "detected, but our files are missing",
+    // A home with none of the supported targets: distinct from "detected, but our files are missing",
     // and the only case where `install-scope` is forced to `none` in the report.
     zeroTargets: !detectedAgents.length,
     install: installOk ? 'complete' : 'incomplete',
@@ -2588,7 +2755,7 @@ function restoreEmptiedFiles() {
 }
 
 function uninstall() {
-  for (const rel of ['.claude/CLAUDE.md', '.codex/AGENTS.md', '.hermes/SOUL.md']) {
+  for (const rel of ['.claude/CLAUDE.md', '.codex/AGENTS.md', '.hermes/SOUL.md', '.minimax/AGENTS.md']) {
     if (stripBlock(join(HOME, rel))) ok(`移除规则块 → ${rel}`);
   }
   // Both candidates: a block may have been written before the workspace was read from config.
@@ -2627,6 +2794,16 @@ function uninstall() {
       writeText(cfg, `${JSON.stringify(data, null, 2)}\n`);
       ok(`移除 MCP 注册 → ${cfg}`);
     }
+  }
+  // MiniMax Code's plugin directory is ours outright (the install creates it), so uninstall takes
+  // the whole subtree back. Only *our* directory: `~/.minimax/plugins/` is the user's namespace and
+  // stays even when it ends up empty — deleting it would remove a place their other plugins live.
+  const mcodeDir = join(HOME, '.minimax', 'plugins', 'misakanet');
+  if (existsSync(mcodeDir)) {
+    try {
+      if (!DRY) rmSync(mcodeDir, { recursive: true, force: true });
+      ok(`移除插件目录 → ${mcodeDir}`);
+    } catch { /* best effort */ }
   }
   const voiceDir = join(stateDir(), 'voice');
   if (existsSync(voiceDir)) {
@@ -3168,6 +3345,7 @@ try {
         else if (agent === 'hermes') await installHermes(hookPath, bearer);
         else if (agent === 'openclaw') await installOpenclaw(bearer);
         else if (agent === 'codewhale') await installCodewhale(bearer);
+        else if (agent === 'mcode') await installMcode(bearer);
         else if (MCP_ONLY_TARGETS[agent]) await installMcpOnly(agent, bearer);
         installed += 1;
       } catch (err) {

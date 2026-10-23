@@ -62,6 +62,8 @@ function makeHeaderHome() {
   writeFileSync(join(home, '.openclaw', 'openclaw.json'), JSON.stringify({ mcp: { servers: {} } }));
   mkdirSync(join(home, '.cursor'), { recursive: true });
   writeFileSync(join(home, '.cursor', 'mcp.json'), JSON.stringify({ mcpServers: {} }));
+  // mcode is a fourth shape (a plugin manifest) and the one target whose file is not a user config.
+  mkdirSync(join(home, '.minimax'), { recursive: true });
   mkdirSync(join(home, '.misakanet-agent'), { recursive: true });
   writeFileSync(join(home, '.misakanet-agent', 'token'), `${TOKEN_SHAPE_OK}\n`);
   return home;
@@ -233,17 +235,18 @@ test('a re-run with no id keeps the header the configs already declare (issue #3
   // mcpHeaders() omitted the header, every entry compared unequal, and all five files were
   // rewritten — the header silently deleted while run 2 still reported success.
   const home = makeHeaderHome();
-  const first = run(home, '--only', 'claude,codex,hermes,openclaw,cursor', '--client-id', 'setup-fixed-0001');
+  const first = run(home, '--only', 'claude,codex,hermes,openclaw,cursor,mcode', '--client-id', 'setup-fixed-0001');
   assert.equal(first.status, 0, first.stdout + first.stderr);
 
-  // One target per syntax: JSON, TOML (inline table), YAML. A missed call site shows up as exactly
-  // one of these missing, which is why they are asserted one by one.
+  // One target per syntax: JSON, TOML (inline table), YAML, and a plugin manifest. A missed call
+  // site shows up as exactly one of these missing, which is why they are asserted one by one.
   const files = {
     claude: '.claude.json',
     codex: '.codex/config.toml',
     hermes: '.hermes/config.yaml',
     openclaw: '.openclaw/openclaw.json',
     cursor: '.cursor/mcp.json',
+    mcode: '.minimax/plugins/misakanet/.claude-plugin/plugin.json',
   };
   for (const [agent, rel] of Object.entries(files)) {
     assert.match(readFileSync(join(home, rel), 'utf8'),
@@ -254,7 +257,10 @@ test('a re-run with no id keeps the header the configs already declare (issue #3
   const before = snapshot(home);
   // No --client-id this time. The only remaining source is the header already in each file, and
   // the first target to read one must hand it to the rest (one machine, one identity).
-  const second = run(home, '--only', 'claude,codex,hermes,openclaw,cursor');
+  // mcode first this time: the adoption has to work from *its* manifest too, not only from
+  // whichever file happened to be read first. (A target that drops the header is caught either way,
+  // but only the order makes each one prove it can be the first reader.)
+  const second = run(home, '--only', 'mcode,claude,codex,hermes,openclaw,cursor');
   assert.equal(second.status, 0, second.stdout + second.stderr);
   assert.deepEqual(snapshot(home), before, 'a re-run with no id must be byte-identical');
   assert.match(second.stdout, /本次实际写入 0 个文件/,
@@ -906,6 +912,191 @@ test('cursor: idempotent — a second run changes nothing', () => {
     assert.match(second.stdout, /Cursor：MCP 已注册（无改动）/, second.stdout);
     assert.equal(readFileSync(join(home, '.cursor', 'mcp.json'), 'utf8'), afterFirst,
       'a second run must not rewrite the file (byte drift is invisible to every other check)');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// ── MiniMax Code (mcode): a plugin directory, not a config file (issue #3777) ──────────────────
+//
+// mcode is the one target whose "MCP config" is not a user config file: it reads plugin directories,
+// and `~/.minimax/config.yaml`'s `mcpServers` is ignored. So the assertions here are about a
+// *directory* (the manifest mcode reads as source `LOCAL_CLAUDE`) plus the one rules file that gives
+// it a behaviour layer — and about the two things that are absent on purpose: no hook, and no
+// overwrite of a manifest that is not ours.
+const MCODE_PLUGIN = '.minimax/plugins/misakanet/.claude-plugin/plugin.json';
+const MCODE_RULES = '.minimax/AGENTS.md';
+
+function makeMcodeHome() {
+  const home = mkdtempSync(join(tmpdir(), 'mn-mcode-'));
+  // Detection is "~/.minimax exists": the CLI's own directory, which the installer does not create
+  // on a machine that does not have mcode.
+  mkdirSync(join(home, '.minimax'), { recursive: true });
+  return home;
+}
+
+test('mcode: writes the plugin manifest and the global rules block', () => {
+  const home = makeMcodeHome();
+  try {
+    const result = runOffline(home, '--only', 'mcode');
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+
+    const plugin = JSON.parse(readFileSync(join(home, MCODE_PLUGIN), 'utf8'));
+    // The manifest shape is what mcode reads; `name` is also the installer's ownership marker.
+    assert.equal(plugin.name, 'misakanet');
+    assert.equal(typeof plugin.version, 'string', 'the installer version is recorded on the manifest');
+    assert.equal(plugin.mcpServers.misakanet.type, 'http');
+    assert.equal(plugin.mcpServers.misakanet.url, 'https://misakanet.org/mcp');
+    assert.equal(plugin.mcpServers.misakanet.headers['X-MisakaNet-Agent'], 'mcode');
+
+    const rules = readFileSync(join(home, MCODE_RULES), 'utf8');
+    assert.match(rules, /<!-- misakanet:start -->/, 'the rules block must be marked for uninstall');
+    assert.match(rules, /misakanet_search/, 'the block is what makes the agent search on its own');
+
+    // The honesty half: mcode has no hook mechanism, and the run must say so instead of implying a
+    // checkpoint was installed.
+    assert.match(result.stdout, /没有 Claude Code 那种钩子/, result.stdout);
+    // The two runtime facts a file cannot carry: the plugin-list criterion and the proxy caveat.
+    assert.match(result.stdout, /mcode plugin list/, result.stdout);
+    assert.match(result.stdout, /NODE_USE_ENV_PROXY=1/, result.stdout);
+    assert.match(result.stdout, /LOCAL_PLUGIN_INSTALL_UNSUPPORTED/, result.stdout);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('mcode: idempotent — a second run changes nothing, byte for byte', () => {
+  const home = makeMcodeHome();
+  try {
+    assert.equal(runOffline(home, '--only', 'mcode').status, 0);
+    const plugin = readFileSync(join(home, MCODE_PLUGIN), 'utf8');
+    const rules = readFileSync(join(home, MCODE_RULES), 'utf8');
+
+    const second = runOffline(home, '--only', 'mcode');
+    assert.equal(second.status, 0, second.stdout + second.stderr);
+    assert.match(second.stdout, /插件清单已是目标内容（无改动）/, second.stdout);
+    assert.match(second.stdout, /规则块 unchanged/, second.stdout);
+    assert.match(second.stdout, /本次实际写入 0 个文件/, second.stdout);
+    assert.equal(readFileSync(join(home, MCODE_PLUGIN), 'utf8'), plugin);
+    assert.equal(readFileSync(join(home, MCODE_RULES), 'utf8'), rules);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('mcode: --mcp-only writes the manifest and no rules block', () => {
+  const home = makeMcodeHome();
+  try {
+    const result = runOffline(home, '--only', 'mcode', '--mcp-only');
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.ok(existsSync(join(home, MCODE_PLUGIN)), 'tier ① is the plugin manifest');
+    assert.ok(!existsSync(join(home, MCODE_RULES)), '--mcp-only must not write the rules block');
+    assert.match(result.stdout, /规则块未写/, result.stdout);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('mcode: --list-writes names both files, with the tiers they belong to', () => {
+  const home = makeMcodeHome();
+  try {
+    const before = snapshot(home);
+    const result = runOffline(home, '--list-writes', '--only', 'mcode');
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.deepEqual(snapshot(home), before, '--list-writes must be a pure read');
+
+    const rows = result.stdout.split('\n').filter((line) => line.startsWith('tier'));
+    const pluginRow = rows.find((row) => row.includes('.minimax/plugins/misakanet/.claude-plugin/plugin.json'));
+    const rulesRow = rows.find((row) => row.includes('.minimax/AGENTS.md'));
+    assert.ok(pluginRow, `the plugin manifest is missing from the manifest:\n${result.stdout}`);
+    assert.ok(rulesRow, `the rules file is missing from the manifest:\n${result.stdout}`);
+    assert.ok(pluginRow.startsWith('tier1'), `the endpoint registration is tier ①: ${pluginRow}`);
+    assert.ok(rulesRow.startsWith('tier2'), `the rules block is tier ②: ${rulesRow}`);
+    // A permission to "add an MCP server" is not a permission to change behaviour, which is the
+    // whole point of separating the tiers.
+    assert.match(rulesRow, /规则块/, rulesRow);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('mcode: --list-writes --mcp-only does not ask for the rules block', () => {
+  const home = makeMcodeHome();
+  try {
+    const result = runOffline(home, '--list-writes', '--mcp-only', '--only', 'mcode');
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const rows = result.stdout.split('\n').filter((line) => line.startsWith('tier'));
+    assert.ok(rows.some((row) => row.includes('plugin.json')), result.stdout);
+    assert.ok(!rows.some((row) => row.includes('.minimax/AGENTS.md')),
+      `--mcp-only must not ask for tier ②:\n${result.stdout}`);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('mcode: uninstall takes back both files and leaves no shell of its own', () => {
+  const home = makeMcodeHome();
+  try {
+    const before = snapshot(home);
+    assert.equal(runOffline(home, '--only', 'mcode').status, 0);
+    const removed = runOffline(home, '--uninstall');
+    assert.equal(removed.status, 0, removed.stdout + removed.stderr);
+
+    // The documented backups are the only things allowed to survive.
+    assert.deepEqual(withoutBackups(snapshot(home)), before,
+      'uninstall must hand a bare home back exactly; left: ' + JSON.stringify(withoutBackups(snapshot(home))));
+    assert.ok(!existsSync(join(home, '.minimax', 'plugins', 'misakanet')),
+      'our plugin directory must be gone');
+    assert.ok(existsSync(join(home, '.minimax', 'plugins')),
+      'the user\'s plugins/ namespace is not ours to delete, even when it ends up empty');
+    assert.ok(existsSync(join(home, '.minimax')), '~/.minimax is the CLI\'s directory, not ours');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('mcode: verify reads the manifest and the rules block, and names a missing manifest', () => {
+  const home = makeMcodeHome();
+  try {
+    assert.equal(runOffline(home, '--only', 'mcode').status, 0);
+
+    const verify = run(home, '--verify');
+    assert.match(verify.stdout, /MiniMax Code：插件清单已注册/, verify.stdout);
+    assert.match(verify.stdout, /MiniMax Code：规则块已装/, verify.stdout);
+    assert.notEqual(verify.status, 0, 'a dead endpoint is still NOT READY');
+
+    // `--report` carries the same facts while the install is intact: mcode is detected, and its
+    // install scope is the endpoint (there is no hook to call it `full`). `install-scope` is judged
+    // from `mcpEntryPresent`, so this line proves the manifest is readable by that path too.
+    const report = run(home, '--report', '--only', 'mcode');
+    assert.match(report.stdout, /^detected-agents: \[mcode\]$/m, report.stdout);
+    assert.match(report.stdout, /^install-scope: mcp-only$/m, report.stdout);
+
+    // The integrity check has to be able to fail: remove the manifest and the same command must
+    // name it instead of reporting the install as complete.
+    rmSync(join(home, MCODE_PLUGIN), { force: true });
+    const broken = run(home, '--verify');
+    assert.match(broken.stdout, /MiniMax Code：插件清单缺失或不是合法 JSON/, broken.stdout);
+    assert.doesNotMatch(broken.stdout, /MiniMax Code：插件清单已注册/, broken.stdout);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('mcode: a manifest that is not ours is preserved, not overwritten', () => {
+  const home = makeMcodeHome();
+  const pluginPath = join(home, MCODE_PLUGIN);
+  try {
+    mkdirSync(dirname(pluginPath), { recursive: true });
+    const foreign = `${JSON.stringify({ name: 'someone-else', version: '1.0.0' }, null, 2)}\n`;
+    writeFileSync(pluginPath, foreign);
+
+    const result = runOffline(home, '--only', 'mcode');
+    // A plugin directory is a user-owned space: installing ours must not delete their plugin.
+    assert.equal(readFileSync(pluginPath, 'utf8'), foreign, 'their manifest must be untouched');
+    assert.match(result.stdout, /不是本安装器写的/, result.stdout);
+    assert.ok(!existsSync(join(home, MCODE_RULES)),
+      'no rules block for an install that could not register the endpoint');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
