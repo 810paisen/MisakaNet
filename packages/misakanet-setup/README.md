@@ -1,7 +1,7 @@
 # @misaka-net/misakanet-setup
 
 One command to teach your **Claude Code**, **Codex**, **Hermes**, **OpenClaw**, **codewhale**,
-**Cursor**, **Gemini CLI**, **Copilot CLI**, **OpenCode** or **Kiro** to
+**Cursor**, **Gemini CLI**, **Copilot CLI**, **OpenCode**, **Kiro** or **MiniMax Code** to
 check MisakaNet's failure lessons before repeating a mistake — and to write up the reusable lessons
 this session produced, at a checkpoint.
 
@@ -23,7 +23,7 @@ knowledge base on its own instead of guessing.
 
 | # | Goal | Mechanism |
 |---|---|---|
-| 1 | the agent **can** call it | MCP server `https://misakanet.org/mcp` (streamable HTTP) in `~/.claude.json`, `~/.codex/config.toml` and `~/.openclaw/openclaw.json` (`mcp.servers.misakanet`), with the Bearer token when registration succeeds — reads need no token (anonymous reads are unmetered since 2026-09-18); the token is what opens the **write** path. Every entry also carries the self-declared context hints `X-MisakaNet-Client` / `-Agent` / `-Os` / `-Version`, which the endpoint records on the read's analytics row and never treats as identity (`codewhale` is the one exception: its server entry has no custom-header field). Hermes is the same thing in its own files: `mcp_servers.misakanet` in `~/.hermes/config.yaml` plus the token in `~/.hermes/.env` under `MCP_MISAKANET_API_KEY`. Five clients take the same idea in one file each, and **each file uses its own key path and URL field** — they are not interchangeable, and a copied entry with the wrong key fails silently (no error, the server simply never appears):
+| 1 | the agent **can** call it | MCP server `https://misakanet.org/mcp` (streamable HTTP) in `~/.claude.json`, `~/.codex/config.toml` and `~/.openclaw/openclaw.json` (`mcp.servers.misakanet`), with the Bearer token when registration succeeds — reads need no token (anonymous reads are unmetered since 2026-09-18); the token is what opens the **write** path. Every entry also carries the self-declared context hints `X-MisakaNet-Client` / `-Agent` / `-Os` / `-Version`, which the endpoint records on the read's analytics row and never treats as identity (`codewhale` is the one exception: its server entry has no custom-header field). Hermes is the same thing in its own files: `mcp_servers.misakanet` in `~/.hermes/config.yaml` plus the token in `~/.hermes/.env` under `MCP_MISAKANET_API_KEY`. Six clients take the same idea in one file each, and **each file uses its own key path and URL field** — they are not interchangeable, and a copied entry with the wrong key fails silently (no error, the server simply never appears):
 
 | client | file | container | URL field |
 |---|---|---|---|
@@ -32,9 +32,16 @@ knowledge base on its own instead of guessing.
 | Copilot CLI | `~/.copilot/mcp-config.json` | `mcpServers` | `url`, with `type: "http"` |
 | OpenCode | `~/.config/opencode/opencode.json` | **`mcp`** | `url`, with `type: "remote"` |
 | Kiro | `~/.kiro/settings/mcp.json` | `mcpServers` | `url` |
+| MiniMax Code | `~/.minimax/plugins/misakanet/.claude-plugin/plugin.json` | `mcpServers` | `url`, with `type: "http"` (a **plugin manifest**, not a user config file) |
+
+There is one difference in kind in that last row: mcode ignores `~/.minimax/config.yaml`'s
+`mcpServers` entirely and reads **plugin directories** instead, so an entry written there would
+look installed and register nothing. Its manifest also comes with the rules block, in
+`~/.minimax/AGENTS.md`; the measured shape, the `mcode plugin list` check and the proxy caveat
+(`NODE_USE_ENV_PROXY=1`) are in `docs/integrations/mcode.md`.
 
 All of them are config files written file-to-file — no subprocess is spawned, so **no token ever appears in a command line**. For Claude Code only, the five **read-only** tools are also added to `permissions.allow` — "can call it" otherwise still means a permission prompt on the very first search, so `0.5.3` pre-allows them (`--verify` reports it, `--report` prints `permissions:`); `write_lesson` is deliberately **not** pre-allowed, because a tool that writes should ask |
-| 2 | the agent **knows when** | rules block appended to `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` / `~/.hermes/SOUL.md` / `~/.openclaw/workspace/AGENTS.md`. **The five JSON-file clients are the exception: they get none**, because their rules are project-scoped (`.cursor/rules/*.mdc`, `GEMINI.md`, `.github/copilot-instructions.md`, `AGENTS.md`, `.kiro/steering/*.md`) and the installer cannot know where your projects live — the install output says so, with the project-side action for each client, instead of implying behaviour changed (issue, retry, risky-operation triggers; desensitisation rules). Wording is **imperative first** ("必须先调 misakanet_search") rather than descriptive, because a field test showed a weaker model reads a descriptive block as background and never calls the tool |
+| 2 | the agent **knows when** | rules block appended to `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` / `~/.hermes/SOUL.md` / `~/.openclaw/workspace/AGENTS.md` / `~/.minimax/AGENTS.md` (mcode's global scope). **The five JSON-config clients are the exception: they get none**, because their rules are project-scoped (`.cursor/rules/*.mdc`, `GEMINI.md`, `.github/copilot-instructions.md`, `AGENTS.md`, `.kiro/steering/*.md`) and the installer cannot know where your projects live — the install output says so, with the project-side action for each client, instead of implying behaviour changed (issue, retry, risky-operation triggers; desensitisation rules). Wording is **imperative first** ("必须先调 misakanet_search") rather than descriptive, because a field test showed a weaker model reads a descriptive block as background and never calls the tool |
 | 4 | *(opt-in)* you **hear** it | `--voice` adds a `PostToolUse` hook that plays the cue the server asked for (`lesson-found` / `failure-warning` / `connect-success` / `pair-success`). Off by default; mute with `MISAKANET_VOICE=0`; see `docs/integrations/mcp-voice-hooks.md` |
 | 3 | the checkpoint **fires** | a hook that counts user turns: turn 1 announces the install to the user, turn 20 (and every 10 after) injects the "write up the reusable lessons and submit them" reminder — the agent does that writing and that submitting, by hand, and the hook itself sends nothing by default; a failed tool call injects a "search before you retry" reminder built from the error text, and only with `MISAKANET_HOOK_FETCH=1` (off by default) does the hook itself send that error text as a search query. Claude Code only today — Codex's user-level hook shape is unconfirmed and OpenClaw's events are unverified, so those two work from the rules block, and `--verify` says so per target instead of implying otherwise |
 
