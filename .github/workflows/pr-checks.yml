@@ -450,13 +450,19 @@ jobs:
           exit $NODE_EXIT
 
 
-      # `tests/frontend.test.js` is the only frontend module the repository has a test for, and
+      # `tests/frontend.test.js` is the frontend suite the repository has, and
       # until 2026-10-07 it ran nowhere: it imported `vitest`, which the root `package.json` does
       # not depend on and `node_modules/vitest` does not contain. `pytest` collects `test_*.py`
       # only, so the `audit` job never saw it either — the same shape as `tests/dsh/`, deleted in
       # #2920. It is ported to `node:test` now (the runner the other 74 worker tests use), and
       # this step is what stops that from being true again: a file that nothing runs is a file
       # that checks nothing, and this job is the required check.
+      #
+      # Since 2026-10-26 it also covers `docs/js/site.js`, the site's shared escaper and JSON
+      # reader — one copy for the whole site, after seven copies drifted apart and #3694 deleted
+      # the one the homepage's panels needed. It lives in this file rather than in a second
+      # root-level `tests/*.test.js` because nothing would run that: `fatal-guard.yml`'s
+      # `node --test 'tests/*.test.js'` runs with `working-directory: packages/fatal-guard`.
       #
       # No `tee` here on purpose — there is no report artefact to keep, and a pipe would need
       # `PIPESTATUS` handling that this step has no reason to get wrong.
