@@ -132,9 +132,22 @@ class Report:
 
 
 def backup(path: Path, dry: bool) -> None:
+    """Keep the *first* copy of the file — the one that was there before we touched it.
+
+    A backup that gets rewritten is not a backup. The second install overwrote the user's
+    original with our own installed content, and the uninstall overwrote it again with the file
+    it was about to strip. Measured 2026-10-26: after `--only claude` and then `--uninstall`,
+    `.claude.json.misakanet.bak` held the *installed* content (the misakanet entry and all)
+    instead of the user's `{"mcpServers": {"cloudflare": ...}}` — the only copy of their file,
+    gone. The `.misakanet.bak` is the record of what was there before us, so it is written once
+    and never replaced.
+    """
     if dry or not path.exists():
         return
-    shutil.copy2(path, path.with_suffix(path.suffix + ".misakanet.bak"))
+    target = path.with_suffix(path.suffix + ".misakanet.bak")
+    if target.exists():
+        return
+    shutil.copy2(path, target)
 
 
 def write_text(path: Path, text: str, dry: bool) -> None:
@@ -166,15 +179,27 @@ def inject_block(path: Path, block: str, dry: bool) -> str:
     return "added"
 
 
+def remove_block_text(text: str) -> str:
+    """The text without our marked block."""
+    pattern = re.compile(rf"[ \t]*<!--\s*{START}\s*-->.*?<!--\s*{END}\s*-->\n?", re.S)
+    return pattern.sub("", text, count=1)
+
+
 def strip_block(path: Path, dry: bool) -> bool:
+    """Remove our block from a file.
+
+    No backup here, and that is the point. Backing up on the way out overwrote the install-time
+    `.misakanet.bak` — the only record of the user's original — with the very file we were
+    removing the block from. The uninstall gives back what the install took; it does not take a
+    second copy of the thing it is undoing.
+    """
     if not path.exists():
         return False
     text = path.read_text(encoding="utf-8")
-    pattern = re.compile(rf"[ \t]*<!--\s*{START}\s*-->.*?<!--\s*{END}\s*-->\n?", re.S)
-    if not pattern.search(text):
+    stripped = remove_block_text(text)
+    if stripped == text:
         return False
-    backup(path, dry)
-    write_text(path, pattern.sub("", text, count=1), dry)
+    write_text(path, stripped, dry)
     return True
 
 
@@ -937,12 +962,55 @@ def install_hermes(home: Path, dry: bool, rep: Report) -> None:
 def _dsh_skill_text(base: str, block: str) -> str:
     """The DSH skill file: the skill text, then the autostart block between the markers.
 
-    The uninstall path removes what this installer wrote by locating the marker pair, so the
-    block has to carry the markers. Without them `strip_block()` finds nothing, the autostart
-    rules survive the uninstall, and the run reports nothing about it — an uninstall that did
-    not undo (the DSH uninstall marker, open since the 18th volume).
+    The block carries the markers so the uninstall can find what this installer wrote. The
+    uninstall does not go through `strip_block()` for this file any more — it takes the whole
+    file back when the file is ours (see `_uninstall_dsh_skill`) — but the markers are still
+    what proves the file is ours.
     """
     return f"{base}\n\n<!-- {START} -->\n{block}\n<!-- {END} -->\n"
+
+
+def _dsh_is_ours(text: str) -> bool:
+    """Does this file carry the marker pair this installer writes?
+
+    The marker is the only evidence that a file at this path belongs to us. The path is a name
+    another tool may legitimately use — `~/.agents/skills/misakanet/` is not a namespace we
+    own — and the skill text inside it is copied from a public repository, so neither the path
+    nor the content can stand in for the marker.
+    """
+    return bool(re.search(rf"[ \t]*<!--\s*{re.escape(START)}\s*-->", text))
+
+
+def _dsh_record_path(home: Path) -> Path:
+    return _state_dir(home) / "dsh_skill.json"
+
+
+def _record_dsh_skill(home: Path, skill: Path, base: str, dry: bool) -> None:
+    """Remember the skill text we installed, so the uninstall knows where our part ends.
+
+    The uninstall has to tell two things apart: the part of the file this installer wrote (which
+    it takes back) and the user's own text inside it (which it leaves alone). The marker pair
+    says the file is ours; only the text we installed says how far our part reaches.
+    """
+    if dry:
+        return
+    path = _dsh_record_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"path": str(skill), "base": base}
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _recorded_dsh_base(home: Path) -> str:
+    """The skill text we installed, or `''` when there is no record of it."""
+    path = _dsh_record_path(home)
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    base = data.get("base") if isinstance(data, dict) else ""
+    return base if isinstance(base, str) else ""
 
 
 def install_dsh(home: Path, dry: bool, rep: Report) -> None:
@@ -954,19 +1022,29 @@ def install_dsh(home: Path, dry: bool, rep: Report) -> None:
     if not dry:
         skill_dst_dir.mkdir(parents=True, exist_ok=True)
     if skill_src.exists():
+        base = skill_src.read_text(encoding="utf-8")
         if dry:
             rep.ok(f"DSH: 会安装 skill → {skill_dst}（源 {skill_src}）")
         else:
             writable = _dsh_skill_text(
-                skill_src.read_text(encoding="utf-8"),
+                base,
                 f"\n---\n\n## 自启动规则（由 install_misakanet_agent.py 追加）\n\n{prompt_block()}\n",
             )
             current = skill_dst.read_text(encoding="utf-8") if skill_dst.exists() else ""
             if current == writable:
                 rep.ok(f"DSH: skill 已是目标内容（无改动）→ {skill_dst}")
+                _record_dsh_skill(home, skill_dst, base, dry)
+            elif current and not _dsh_is_ours(current):
+                # The file is the user's, not ours. The same rule the mcode plugin directory
+                # follows (#3831): a name we also use can legitimately belong to someone else,
+                # so the installer does not overwrite it — it says so and leaves it alone.
+                rep.needs_manual(
+                    f"DSH: {skill_dst} 不是本安装器写的（没有我们的标记）→ 已原样保留（不覆写）；"
+                    "确认它不是你的 skill 之后把它改名或移走，再重跑安装")
             else:
                 backup(skill_dst, dry)
                 skill_dst.write_text(writable, encoding="utf-8")
+                _record_dsh_skill(home, skill_dst, base, dry)
                 rep.ok(f"DSH: 安装 skill（含自启动规则）→ {skill_dst}")
     else:
         downloaded = _fetch_raw("skills/misakanet/SKILL.md")
@@ -975,6 +1053,7 @@ def install_dsh(home: Path, dry: bool, rep: Report) -> None:
                 skill_dst_dir.mkdir(parents=True, exist_ok=True)
                 skill_dst.write_text(
                     _dsh_skill_text(downloaded, f"\n---\n\n{prompt_block()}\n"), encoding="utf-8")
+                _record_dsh_skill(home, skill_dst, downloaded, dry)
             rep.ok(f"DSH: 从远端取回 skill 并安装 → {skill_dst}")
         else:
             rep.needs_manual("DSH: 既不在仓库内、也取不回 skill 源 → 手动复制 skills/misakanet/")
@@ -1348,6 +1427,65 @@ def mcode_plugin_ownership(home: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def _uninstall_dsh_skill(home: Path, dry: bool, rep: Report) -> None:
+    """Take back the DSH skill file — and only what this installer wrote.
+
+    The contract is one line: *we wrote it, we take it back; the user wrote a single character,
+    we do not touch it.*
+
+    * a file without our marker is not ours — it is not rewritten, not deleted and not read;
+    * a file that is exactly what we installed is ours alone — it goes, and so does the directory
+      if that leaves it empty;
+    * a file the user edited after the install is ours *and* theirs — our part comes out, their
+      text stays, and no backup is taken (the install already kept one, and a second one would
+      overwrite it).
+
+    This used to go through `strip_block()`, which left the skill text behind and — worse — took
+    a backup of the file on the way out, overwriting the install-time `.misakanet.bak` with the
+    file it was about to strip. The user's original was gone after an uninstall.
+    """
+    skill = home / ".agents" / "skills" / "misakanet" / "SKILL.md"
+    if not skill.exists():
+        return
+    text = skill.read_text(encoding="utf-8")
+    if not _dsh_is_ours(text):
+        rep.needs_manual(
+            f"DSH: {skill} 没有本安装器的标记 → 已保留（不碰）；"
+            "确认它不是 MisakaNet 留下的之后手动删掉它")
+        return
+    remainder = remove_block_text(text)
+    base = _recorded_dsh_base(home)
+    if base and remainder.startswith(base):
+        remainder = remainder[len(base):]
+    elif not base:
+        # No record of what we installed (an older installer, or a wiped state directory): fall
+        # back to the skill text in this repository, and if that does not match, keep what is
+        # there. Guessing would delete the user's text.
+        source = HERE.parent.parent / "skills" / "misakanet" / "SKILL.md"
+        if source.exists() and remainder.strip() == source.read_text(encoding="utf-8").strip():
+            remainder = ""
+    remainder = remainder.strip()
+    if remainder:
+        write_text(skill, remainder + "\n", dry)
+        rep.ok(f"DSH: 已移除自启动规则，保留你自己写的内容 → {skill}")
+        return
+    try:
+        if not dry:
+            skill.unlink()
+        rep.ok(f"DSH: 移除 skill 文件 → {skill}")
+    except OSError as exc:
+        rep.needs_manual(f"DSH: 删不掉 {skill}（{exc}）→ 手动删除它")
+        return
+    directory = skill.parent
+    try:
+        if directory.is_dir() and not any(directory.iterdir()):
+            if not dry:
+                directory.rmdir()
+            rep.ok(f"DSH: 移除空目录 → {directory}")
+    except OSError as exc:
+        rep.needs_manual(f"DSH: 删不掉 {directory}（{exc}）→ 手动删除它")
+
+
 def uninstall(home: Path, dry: bool, rep: Report) -> None:
     hermes_rules_removed = False
     targets = [
@@ -1356,7 +1494,6 @@ def uninstall(home: Path, dry: bool, rep: Report) -> None:
         home / ".codex" / "AGENTS.md",
         home / ".hermes" / "SOUL.md",
         home.joinpath(*MCODE_RULES_REL),
-        home / ".agents" / "skills" / "misakanet" / "SKILL.md",
     ]
     for path in targets:
         if strip_block(path, dry):
@@ -1370,6 +1507,9 @@ def uninstall(home: Path, dry: bool, rep: Report) -> None:
             if not dry:
                 path.unlink()
             rep.ok(f"删除只剩空白的规则文件 → {path}")
+    # The DSH skill is not a rules file with a block inside it — it is a file this installer wrote
+    # in full, and taking it back is a different operation from removing a marked block.
+    _uninstall_dsh_skill(home, dry, rep)
     # MiniMax Code's plugin directory is ours outright (we create it), so uninstall takes the whole
     # subtree back — but only after asking the same ownership question the install asks. Deleting a
     # directory the install said it had preserved is irreversible (issue #3831).
