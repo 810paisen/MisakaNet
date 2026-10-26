@@ -150,6 +150,44 @@ that: the path read the logs, reached a decision, and still posted nothing. No r
 text can see it; it needs a probe that exercises the path
 (`tests/test_ci_failure_lesson_path.py`).
 
+## One rule, one copy — and a gate that says so
+
+`escapeHTML` and `readJsonResponse` used to be copied into seven pages. The copies were not equal:
+four escaped with `String(value)` (so a null rendered as the words "null"), one with
+`String(value || '')` (so a count of zero rendered as nothing at all), and two with
+`String(val ?? '')`. Then #3694 moved the registration form to `/register/` and deleted the copy that
+lived beside it — the copy the form used as a form — while the homepage's panels kept calling it.
+The homepage loaded, the panels threw a `ReferenceError` the first time they had data to render,
+each panel's own `catch` turned that into "the activity snapshot is unavailable", and the reader was
+told the site was out of date while `/api/activity` was answering 200. Three panels went blank at
+once, and every gate was green: there is no eslint, no bundler and no type checker in this tree.
+
+So the copies are gone. One copy lives in **`docs/js/site.js`**, every page loads it with
+`<script src="/js/site.js"></script>`, and the pages that used to carry a copy now carry none. The
+module is a **classic script**, not an ES module: a module's scope is not visible to the pages'
+classic inline scripts, and a module script is deferred, so it would run *after* them.
+
+Two rules are enforced, both by `scripts/check_page_scripts.py`:
+
+* **missing** — a page calls a name it does not define, and no script it loads defines it. This is
+  the #3694 shape, and it is what the script was written for.
+* **duplicate** — a page declares, at its top level, a name the shared module already publishes. A
+  second copy is how the copies drifted apart in the first place. A name declared *inside* a
+  function is that function's own business and is not a finding: a gate that flags ordinary code
+  teaches maintainers to ignore it.
+
+The script runs inside `tests/test_check_page_scripts.py`, which rides on the existing **`audit`**
+context, so no ruleset change was needed. It is not decoration: `scripts/check_page_scripts.py
+--reverse-test` injects both shapes and asserts each is caught — and asserts that the pages which
+are *right* stay quiet (a page that defines its own helper in a tree with no shared module; a page
+that loads the module; a page that shadows the name inside a function). The canonical semantics are
+pinned separately, in `tests/frontend.test.js`, because a module nobody pins drifts again: the
+tests there fail if the escape goes back to `String(value)` or `String(value || '')`, and if the
+module is turned into an ES module.
+
+What it cannot see: a page that loads the module and then misuses it, and a copy that was renamed
+rather than duplicated — the rule knows the names the module publishes, not the names a page invents.
+
 ## Soft Gates (advisory, won't block)
 
 These report but cannot stop a merge. Some are advisory by design; two are advisory by accident, which is

@@ -24,11 +24,16 @@ class TestReputationLeaderboardPage(unittest.TestCase):
         self.assertIn('value="weekly"', self.html)
         self.assertIn('url.pathname === "/api/insights/reputation-leaderboard"', self.worker)
 
-    def test_page_is_responsive_and_self_contained(self):
+    def test_page_is_responsive_and_uses_the_shared_escaper(self):
         self.assertIn("@media (max-width: 520px)", self.html)
-        self.assertNotIn("<script src=", self.html)
         self.assertNotIn("cdn.", self.html)
-        self.assertIn("function escapeHTML", self.html)
+        # The escaper is not copied into the page any more. One copy lives in `docs/js/site.js`
+        # and every page loads it: the seven copies are how they drifted apart in the first
+        # place, and #3694 is what that cost. A second copy here would be the shape again.
+        self.assertIn('<script src="/js/site.js"></script>', self.html)
+        self.assertNotIn("function escapeHTML", self.html)
+        # ...and the page still escapes what it renders: the helper moved, the duty did not.
+        self.assertIn("escapeHTML(", self.html)
 
     def test_page_discloses_non_monetary_points(self):
         self.assertIn("no cash value", self.html.lower())

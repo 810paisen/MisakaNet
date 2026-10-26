@@ -953,7 +953,6 @@
     color: var(--fg-2);
   }
 
-
   /* ── Onboarding Modal ── */
   .modal-overlay {
     display: none;
@@ -1094,7 +1093,6 @@
     color: var(--fg-3);
     line-height: 1.8;
   }
-
 
   /* ── Glass container for main content depth ── */
   .content-glass {
@@ -2109,6 +2107,10 @@
 
 </div>
 
+<!-- The escaper and the JSON reader every fetch here ends in. One copy, loaded before the script
+     below: `docs/js/site.js` is where they live now (they used to be copied into seven pages, and
+     the copies drifted — #3694 is what that cost). -->
+<script src="/js/site.js"></script>
 <script>
 const REPO = "Ikalus1988/MisakaNet";
 const BASE = "https://api.github.com/repos/" + REPO;
@@ -2568,7 +2570,6 @@ function getClassificationClass(cls) {
   }
 }
 
-
 /**
  * @typedef {Object} Lesson
  * @property {string} id - 知识条目 ID
@@ -2907,28 +2908,11 @@ function searchLessons() {
 // ── Request collapsing: reuse in-flight promise for same URL ──
 const _pendingPromises = new Map();
 
-// The JSON reader every fetch on this page goes through. #3694 moved the registration form to
-// /register/ and took this function with it, for the same reason it took `escapeHTML`: the form
-// was the only thing here that used it. The form was never the only thing that used it —
-// `fetchWithTimeout` and `fetchPOST` below both end in `readJsonResponse(r)`, so every JSON this
-// page fetched threw a ReferenceError, was swallowed by the panel's own `catch`, and was reported
-// to the reader as an out-of-date snapshot. The body is the same one /register/ still runs.
-async function readJsonResponse(response) {
-  const text = await response.text();
-  const contentType = response.headers.get('content-type') || '';
-  const snippet = text.slice(0, 80);
-  if (!contentType.includes('application/json')) {
-    if (snippet.trimStart().startsWith('<')) {
-      throw new Error(`Proxy returned HTML (${response.status}). Refresh and try again, or use GitHub Issue registration.`);
-    }
-    throw new Error(`Non-JSON response (${response.status}): ${snippet}`);
-  }
-  try {
-    return JSON.parse(text);
-  } catch (err) {
-    throw new Error(`Invalid JSON response (${response.status}): ${snippet}`);
-  }
-}
+// `readJsonResponse` — the reader every fetch on this page ends in — lives in /js/site.js now, for
+// the same reason `escapeHTML` does. #3694 took the copy that lived here, and `fetchWithTimeout`
+// and `fetchPOST` below both ended in it: every JSON this page fetched threw a ReferenceError,
+// the panel's own `catch` swallowed it, and the reader was told the site's data was out of date
+// while the API was answering 200.
 
 async function fetchWithTimeout(url, timeoutMs = 8000) {
   const ctrl = new AbortController();
@@ -3301,22 +3285,15 @@ function formatActivityAge(generatedAt) {
   return getTimeAgo(at);
 }
 
-// The escape every renderer below shares. #3694 moved the registration form to /register/ and
-// took this function with it — the form was the only thing on this page that used it — while the
-// panels below kept calling it. A page that calls a name it never defines fails at the call rather
-// than at the load, so the failure looked like a broken API: the panel fell back to the snapshot,
-// fell back again, and printed "活动快照暂不可用" while `/api/activity` was answering 200 the whole
-// time. Hence it is defined here, beside the panels that use it, and
-// `tests/test_site_shared_helpers.py` is the gate that says a page may not call a helper it does
-// not define.
-function escapeHTML(val) {
-  return String(val ?? '').replace(/[&<>"']/g, ch => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  }[ch]));
-}
+// The escape every renderer below shares now lives in /js/site.js — one copy for the whole site,
+// loaded above. It used to be copied into seven pages, and the copies drifted apart: four escaped
+// with `String(value)` (a null printed as the words "null"), one with `String(value || '')` (a
+// count of zero printed as nothing), and two with the `??` form. #3694 is what the copying cost:
+// the copy that was deleted was the copy the panels needed, and the panels' own `catch` turned the
+// ReferenceError into "the snapshot is out of date" while the API was answering 200.
 
-// Both panels below build markup from JSON, so both escape it — with the page's own
-// `escapeHTML` above, not a second copy of it, and not `DOMPurify`, which is loaded from a CDN: a
+// Both panels below build markup from JSON, so both escape it — with the shared `escapeHTML`
+// loaded above, not a second copy of it, and not `DOMPurify`, which is loaded from a CDN: a
 // sanitizer that fails to load would throw inside the render and take the panel with it, and these
 // values need escaping rather than sanitizing.
 function safeHref(url) {

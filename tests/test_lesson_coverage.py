@@ -26,12 +26,17 @@ class TestLessonCoverageDashboard(unittest.TestCase):
         self.assertIn("needs-review", self.html)
         self.assertIn("uncovered", self.html)
 
-    def test_page_is_responsive_self_contained_and_escaped(self):
+    def test_page_is_responsive_and_escaped_by_the_shared_module(self):
         self.assertIn("@media (max-width: 700px)", self.html)
         self.assertIn("@media (max-width: 460px)", self.html)
-        self.assertNotIn("<script src=", self.html)
         self.assertNotIn("cdn.", self.html)
-        self.assertIn("function escapeHTML", self.html)
+        # The escaper is not copied into the page any more. One copy lives in `docs/js/site.js`
+        # and every page loads it: the seven copies are how they drifted apart in the first
+        # place, and #3694 is what that cost. A second copy here would be the shape again.
+        self.assertIn('<script src="/js/site.js"></script>', self.html)
+        self.assertNotIn("function escapeHTML", self.html)
+        # ...and the page still escapes what it renders: the helper moved, the duty did not.
+        self.assertIn("escapeHTML(", self.html)
 
     def test_privacy_contract_is_explicit(self):
         self.assertIn("Raw search queries", self.html)
