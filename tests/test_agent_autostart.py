@@ -251,12 +251,16 @@ def test_uninstall_restores_the_original_state(tmp_path):
     assert not (home / ".claude" / "CLAUDE.md").exists(), "a file created only for our block should go"
 
 
-# ── DSH: the uninstall removes the autostart block it wrote ─────────────────────────────────────
-# Every rule block this installer writes is found again by its markers. The DSH block was written
-# without them, so `strip_block()` found nothing: the autostart rules survived the uninstall and
-# the run reported nothing about it — an uninstall that did not undo (the DSH uninstall marker,
-# open since the 18th volume).
-def test_dsh_uninstall_removes_the_autostart_block_it_wrote(tmp_path):
+# ── DSH: the uninstall takes back exactly what this installer wrote ─────────────────────────────
+# The contract is one line: *we wrote it, we take it back; the user wrote a single character, we
+# do not touch it.*
+#
+# The old behaviour stripped the autostart block and left the skill text behind, and it took a
+# backup of the file on the way out — which overwrote the install-time `.misakanet.bak` with the
+# file it was about to strip, so the user's original was gone after an uninstall. Measured
+# 2026-10-26: after `--only claude` and then `--uninstall`, `.claude.json.misakanet.bak` held the
+# *installed* content instead of the user's `{"mcpServers": {"cloudflare": ...}}`.
+def test_dsh_uninstall_takes_back_the_file_it_wrote(tmp_path):
     home = make_home(tmp_path)
     install = run_installer(home, "--only", "dsh")
     assert install.returncode == 0, install.stdout + install.stderr
@@ -264,19 +268,86 @@ def test_dsh_uninstall_removes_the_autostart_block_it_wrote(tmp_path):
     skill = home / ".agents" / "skills" / "misakanet" / "SKILL.md"
     written = skill.read_text(encoding="utf-8")
     assert "misakanet:start" in written and "misakanet:end" in written, (
-        "the autostart block must carry the markers the uninstall looks for:\n" + written)
+        "the autostart block must carry the markers that prove the file is ours:\n" + written)
     assert "自启动规则" in written, written
 
     removed = run_installer(home, "--uninstall")
     assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not skill.exists(), (
+        "the file this installer wrote is ours alone, so the uninstall takes it back:\n"
+        + removed.stdout)
+    assert not skill.parent.exists(), (
+        "the directory is empty once the file is gone, so it goes too:\n" + removed.stdout)
+
+
+def test_dsh_install_does_not_overwrite_a_file_that_is_not_ours(tmp_path):
+    """`~/.agents/skills/misakanet/` is not a namespace we own.
+
+    The same rule the mcode plugin directory follows (#3831): a name we also use can
+    legitimately belong to someone else, so the installer leaves the file alone and says so
+    instead of replacing it.
+    """
+    home = make_home(tmp_path)
+    skill = home / ".agents" / "skills" / "misakanet" / "SKILL.md"
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    theirs = "# my own skill\n\nnot yours\n"
+    skill.write_text(theirs, encoding="utf-8")
+
+    install = run_installer(home, "--only", "dsh")
+    assert install.returncode == 0, install.stdout + install.stderr
+    assert skill.read_text(encoding="utf-8") == theirs, (
+        "the install must not overwrite a file it did not write:\n" + install.stdout)
+    assert "已原样保留" in install.stdout, install.stdout
+
+
+def test_dsh_uninstall_leaves_a_file_that_is_not_ours_alone(tmp_path):
+    home = make_home(tmp_path)
+    skill = home / ".agents" / "skills" / "misakanet" / "SKILL.md"
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    theirs = "# my own skill\n\nnot yours\n"
+    skill.write_text(theirs, encoding="utf-8")
+
+    removed = run_installer(home, "--uninstall")
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert skill.read_text(encoding="utf-8") == theirs, (
+        "the uninstall must not touch a file it did not write:\n" + removed.stdout)
+    assert "已保留" in removed.stdout, removed.stdout
+
+
+def test_dsh_uninstall_keeps_the_text_the_user_added_after_the_install(tmp_path):
+    """Ours and theirs in one file: our part goes, their text stays."""
+    home = make_home(tmp_path)
+    install = run_installer(home, "--only", "dsh")
+    assert install.returncode == 0, install.stdout + install.stderr
+
+    skill = home / ".agents" / "skills" / "misakanet" / "SKILL.md"
+    with skill.open("a", encoding="utf-8") as fh:
+        fh.write("\n## my own notes\n\nkeep me\n")
+
+    removed = run_installer(home, "--uninstall")
+    assert removed.returncode == 0, removed.stdout + removed.stderr
     after = skill.read_text(encoding="utf-8")
-    assert "自启动规则" not in after, (
-        "the uninstall must remove the block it wrote:\n" + after)
     assert "misakanet:start" not in after, after
-    # What the installer did not write must survive: the skill text is the source's, untouched.
-    source = (REPO / "skills" / "misakanet" / "SKILL.md").read_text(encoding="utf-8").strip()
-    assert after.strip() == source, (
-        "uninstall must leave the skill text it found:\n" + after)
+    assert "自启动规则" not in after, after
+    assert "keep me" in after, (
+        "the user's own text must survive the uninstall:\n" + after)
+
+
+def test_the_uninstall_does_not_overwrite_the_install_backup(tmp_path):
+    """The `.misakanet.bak` is the only copy of the user's original file.
+
+    Backing up on the way out overwrote it with the file being stripped, so an uninstall
+    destroyed what the install had carefully preserved.
+    """
+    home = make_home(tmp_path)
+    run_installer(home, "--only", "claude")
+    bak = home / ".claude.json.misakanet.bak"
+    assert bak.read_text(encoding="utf-8") == json.dumps(SEED_CLAUDE_JSON)
+
+    removed = run_installer(home, "--uninstall")
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert bak.read_text(encoding="utf-8") == json.dumps(SEED_CLAUDE_JSON), (
+        "the uninstall must leave the install-time backup alone:\n" + bak.read_text(encoding="utf-8"))
 
 
 def test_dry_run_writes_nothing(tmp_path):
