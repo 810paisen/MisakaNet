@@ -394,6 +394,29 @@ def test_the_pytest_legs_verdict_is_the_workflow_step_itself():
     assert body.count("exit 1") >= 4
 
 
+def test_the_node_summary_is_read_in_both_reporter_shapes():
+    """Node's reporter changed the summary prefix; the audit must judge the run, not the spelling.
+
+    Node v23.0.0 switched the default reporter on a non-TTY stdout from `tap` to `spec`, and the
+    summary lines changed their prefix from `#` to `ℹ` (U+2139). The audit job pins node 22, so
+    the audit itself reads the TAP shape — but this script also runs on whatever node the runner
+    image ships, because `ci-cross-platform.yml` has no setup-node step and the macOS image is on
+    node 24. Measured 2026-10-26: the macOS legs ended with `ℹ fail 0`, the criterion came back
+    "could not be evaluated" (exit 3), and the matrix went red on a gate that was perfectly fine.
+
+    So both shapes have to be read — and a summary of zero tests has to stay unreadable in both:
+    that is the #2006 shape this check exists for.
+    """
+    for prefix in ("#", "ℹ"):
+        green = f"{prefix} tests 3\n{prefix} pass 3\n{prefix} fail 0\n"
+        red = f"{prefix} tests 3\n{prefix} pass 2\n{prefix} fail 1\n"
+        assert gma.NODE_PASS_RE.search(green), prefix
+        assert gma.NODE_FAIL_RE.search(red), prefix
+        # A run that collected nothing is not a run that passed: `pass 0` proves nothing either way.
+        assert not gma.NODE_PASS_RE.search(f"{prefix} pass 0\n"), prefix
+        assert not gma.NODE_FAIL_RE.search(green), prefix
+
+
 def test_the_coverage_floor_uses_the_real_plugin_when_it_is_installed():
     """The one criterion-level stub says which mode it ran in, and CI must not silently stub it.
 
