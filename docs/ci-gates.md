@@ -121,6 +121,24 @@ worth knowing before treating a green page as coverage.
 | **pr-agent / pr-genius** | external | Review helpers |
 | **Workers Builds: misakanet-web** | Cloudflare bot | The site build; external, and noisy on bot PRs |
 
+**Why the other legs stay advisory, and what keeps them from being ignored.** They are advisory *by
+decision*, and the reason is that their verdict is not **deterministic**: the matrix has no
+`setup-node` step, so a leg runs whatever node the runner image ships — and node's test reporter
+changed its summary prefix in v23.0.0 (`# pass N` → `ℹ pass N`), which on 2026-10-26 made the
+audit criterion unreadable on the macOS legs and turned a healthy gate into "could not be
+evaluated" (exit 3). A leg whose answer depends on the runner image is not a merge blocker: making
+it one would turn infrastructure drift into a blocked merge, and the audit cannot prove such a leg
+can fail either — it executes step bodies on its own ubuntu runner, where a macOS leg does not
+exist.
+
+What the other legs *are* allowed to be is loud. `Cross-Platform Tests` is the trigger of
+`ci-lesson-search.yml`, so a red leg surfaces the matching lessons on the pull request — and that
+workflow now **fails loudly when it cannot read the logs it exists to read**. It used to swallow
+the refusal (the token had no `actions` scope) and stay green, so a failing matrix produced no note
+and nothing looked wrong; measured 2026-10-26, every run of that path behaved that way.
+`tests/test_ci_failure_lesson_path.py` pins the difference between "there was nothing to report"
+and "we were not allowed to look".
+
 ## External (not gated)
 
 These are informational only and never block merge.
