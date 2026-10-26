@@ -104,6 +104,18 @@ DCO_WORKFLOW = REPO / ".github" / "workflows" / "dco-check.yml"
 CROSS_PLATFORM_WORKFLOW = REPO / ".github" / "workflows" / "ci-cross-platform.yml"
 PR_CHECKS_WORKFLOW = REPO / ".github" / "workflows" / "pr-checks.yml"
 
+# Node's test reporter changed with v23.0.0: on a non-TTY stdout the default reporter went from
+# `tap` to `spec`, and the summary lines changed their prefix from `#` to `ℹ` (U+2139). The audit
+# job pins node 22, so the audit itself reads the TAP shape — but this script also runs on whatever
+# node the *runner image* ships, because `ci-cross-platform.yml` has no setup-node step and the
+# macOS image is on node 24. Measured 2026-10-26: the macOS legs of the matrix ended with
+# `ℹ fail 0`, the audit could not read a verdict out of that, and the criterion came back
+# "could not be evaluated" (exit 3) instead of a green or a red.
+#
+# Both prefixes are accepted, so the audit judges the *run* rather than the reporter's spelling.
+NODE_PASS_RE = re.compile(r"^(?:#|ℹ) pass [1-9]", re.MULTILINE)
+NODE_FAIL_RE = re.compile(r"^(?:#|ℹ) fail [1-9]", re.MULTILINE)
+
 DEFAULT_TIMEOUT = 120.0
 # Reserved exit status for "the criterion could not be evaluated": a step was renamed, an input had
 # no value, a scanner crashed. It must not be read as a verdict — a broken gate is not a gate that
@@ -858,14 +870,14 @@ def _drive_audit_worker_suite(scenario: Path) -> int:
     combined = proc.stdout + proc.stderr
     if proc.returncode == 0:
         # A green suite that ran no tests is the #2006 failure shape: prove it ran one.
-        if not re.search(r"^# pass [1-9]", combined, re.MULTILINE):
+        if not NODE_PASS_RE.search(combined):
             raise CriterionUnavailable(
                 "the worker suite exited 0 without running a test — a green run here would prove "
                 "nothing")
         return 0
     if proc.returncode == 127 or "command not found" in combined:
         raise CriterionUnavailable("node could not be executed in the scenario")
-    if not re.search(r"^# fail [1-9]", combined, re.MULTILINE) and "not ok" not in combined:
+    if not NODE_FAIL_RE.search(combined) and "not ok" not in combined:
         raise CriterionUnavailable(
             f"the worker suite exited {proc.returncode} without reporting a failing test")
     return 1
