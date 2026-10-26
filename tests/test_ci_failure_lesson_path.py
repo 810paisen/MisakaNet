@@ -141,6 +141,39 @@ def test_the_run_says_what_it_saw():
     )
 
 
+def _code(body: str) -> str:
+    """The body without its comments — a comment that mentions a broken call is not a call.
+
+    The step explains this very bug in a comment next to the fix, so a check that reads the raw
+    text would flag the explanation as the fault.
+    """
+    kept = []
+    for line in body.splitlines():
+        if line.strip().startswith("//"):
+            continue
+        kept.append(line.split(" //")[0])
+    return "\n".join(kept)
+
+
+def test_the_same_repo_test_compares_the_full_name_it_actually_has():
+    """`context.repo` is `{owner, repo}` — it has no `full_name`.
+
+    Measured 2026-10-26: the step compared `run.head_repository.full_name` against
+    `context.repo.full_name`, which is `undefined` (@actions/github's `Context.repo` returns
+    `{owner, repo}` and nothing else). So `is_same_repo` was always `'false'`, and the
+    `decision == 'intake'` branch of the comment step could never fire — the path read the logs,
+    reached a decision, and still posted nothing.
+    """
+    body = _context_script()
+    assert "context.repo.full_name" not in _code(body), (
+        "`context.repo` has no `full_name`; comparing against it is always false, and a false "
+        "here means the comment step's `intake` branch never fires"
+    )
+    assert "${context.repo.owner}/${context.repo.repo}" in body, (
+        "the full name has to be assembled from the two fields the context really has"
+    )
+
+
 def test_the_decision_step_can_reach_a_decision_on_a_failing_log(tmp_path):
     """The bot half of the path must be able to say something about a CI failure.
 

@@ -142,7 +142,12 @@ jobs:
               runName = run.name || 'CI';
               // same-repo failures may surface "novel intake" notes; fork PRs stay quiet
               const headRepo = (run.head_repository || {}).full_name || '';
-              isSameRepo = headRepo === context.repo.full_name ? 'true' : 'false';
+              // `context.repo` is `{owner, repo}` — it has no `full_name` (@actions/github's
+              // Context.repo). Comparing against `context.repo.full_name` compared the head repo
+              // with `undefined`, so this was always false, `is_same_repo` was always 'false', and
+              // the `decision == 'intake'` branch of the comment step could never fire: the path
+              // read the logs, reached a decision, and still posted nothing (measured 2026-10-26).
+              isSameRepo = headRepo === `${context.repo.owner}/${context.repo.repo}` ? 'true' : 'false';
 
               // The PR number is where the note goes — without it there is nowhere to put it, and
               // the run would end as a search nobody sees. `workflow_run.pull_requests` is not
