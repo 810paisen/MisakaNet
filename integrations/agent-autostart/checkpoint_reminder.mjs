@@ -20,11 +20,11 @@
  * Manual test:
  *   echo '{"session_id":"demo"}' | node checkpoint_reminder.mjs prompt
  */
-import { writeFileSync, mkdirSync, renameSync, readFileSync } from 'node:fs';
+import { writeFileSync, mkdirSync, renameSync, readFileSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 // NOTE: JavaScript does not concatenate adjacent string literals the way Python does.
 // Writing these as three consecutive strings silently keeps only the first one, so the
@@ -419,11 +419,38 @@ async function failureMode(payload) {
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
+/**
+ * Is this file the process's entry point?
+ *
+ * `import.meta.url` is the module's *resolved* URL: Node's ESM loader resolves symlinks, so a
+ * script started through a symlink gets the real path there while `process.argv[1]` still holds
+ * the symlinked one. Comparing the two strings directly then never matches, and the hook does
+ * nothing at all — silently, with exit 0, which is the shape of a tool that looks installed and
+ * is not.
+ *
+ * macOS is where that bites: `/var` is a symlink to `/private/var`, every temporary directory
+ * lives under it, and the packaged e2e installs the hook into such a directory. On 2026-10-26
+ * all three macOS legs went red with `exit=0 stdout=""` — the hook ran, and did nothing.
+ *
+ * So compare the real paths. The direct comparison is kept for a loader started with
+ * `--preserve-symlinks`, where the symlink survives in `import.meta.url` as well.
+ */
+function isEntryPoint() {
+  const invoked = process.argv[1];
+  if (!invoked) return false;
+  const here = fileURLToPath(import.meta.url);
+  if (here === invoked) return true;
+  try {
+    return realpathSync(invoked) === realpathSync(here);
+  } catch {
+    return false;
+  }
+}
+
 // Run only when this file is the entry point (`node checkpoint_reminder.mjs …`). Importing it must
 // not read stdin or exit the process: the inner `search()` is the gate that redacts the query on
 // the way out, and #3719 wants a test that can drive it with *raw* text and see the payload.
-const isEntry = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
-if (isEntry) {
+if (isEntryPoint()) {
   const mode = process.argv[2] || 'prompt';
   try {
     const payload = parsePayload(await readStdin());
