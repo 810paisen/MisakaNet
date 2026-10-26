@@ -105,6 +105,51 @@ change that removes a gate's teeth *is* a pull request, and a weekly audit finds
 The job is a single runner with read-only permissions and no secrets, and superseded runs are
 cancelled; it is not in the ruleset, so it advises rather than blocks.
 
+## A mechanism that runs by itself must be able to fail
+
+A workflow that runs on a `schedule`, on `workflow_run`, on `issues` or on `issue_comment` runs
+**without anybody watching it**. Nobody is waiting for that run, nobody sees its logs, and nobody
+gets a notification when it stops working. So for those workflows the only honest failure signal is
+the run itself: if the thing the mechanism exists to produce can fail quietly, the mechanism can
+end **green having produced nothing** — and nothing in the repository will ever say so.
+
+That is not hypothetical. `ci-lesson-search.yml` — "our CI failed, so surface the lessons that
+match" — fired on a genuinely failing matrix and produced nothing: the log read was refused by the
+token's missing `actions` scope, the refusal was swallowed by an empty `catch`, the downstream steps
+were skipped, the pull request got no note, and the workflow reported success. It is the shape this
+repository already knows twice: a crash that became a *constant payload* so the run stayed green
+with nothing posted (#1825), and a step whose `$ERROR_SIG` was undefined so the search had nothing
+to search and stayed green (#1984 — **a green run is not evidence unless something in it can
+differ**).
+
+The rule is therefore: **nothing on the path to the delivery may swallow a failure quietly.**
+
+* the **producer** — the command that posts the comment or opens the issue — must be load-bearing:
+  if it fails, the step fails and the workflow ends red;
+* the producer's **feeders** — the steps whose outputs gate it — must be load-bearing too, and so
+  must their feeders. A feeder that swallows its failure leaves the producer *skipped*, and a
+  skipped producer is a mechanism that produced nothing and reported success.
+
+It lives in `tests/test_self_running_mechanisms.py` and rides on the existing **`audit`** context
+(the suite runs there), so no ruleset change was needed. The check is **derived from the workflows
+themselves**, not from a registry of them: a new self-running workflow is covered the day it is
+written, which is what a registry of sixty-odd workflows cannot do.
+
+It is not decoration — the check is run against the *pre-fix* `ci-lesson-search.yml` and goes red
+on it, and it found the one violation the repository still had:
+`provenance-gate.yml`'s comment step carried `continue-on-error: true` and an empty `catch (e) {}`
+since PR #1768, so a comment that could not be posted left a green run and a pull request with no
+verdict on it.
+
+What it cannot see, stated rather than left to be discovered: a production that happens *inside a
+script* (`python3 scripts/register_issue.py`), a production performed by a *third-party action*
+(`actions/stale`), a production that goes to *another system* (`lesson-notify.yml`'s Feishu
+webhook), and a *semantic* silence — the producer runs, the run is green, and what it produced is
+empty because the decision it was reading was always "no". `context.repo.full_name` was exactly
+that: the path read the logs, reached a decision, and still posted nothing. No rule over workflow
+text can see it; it needs a probe that exercises the path
+(`tests/test_ci_failure_lesson_path.py`).
+
 ## Soft Gates (advisory, won't block)
 
 These report but cannot stop a merge. Some are advisory by design; two are advisory by accident, which is
