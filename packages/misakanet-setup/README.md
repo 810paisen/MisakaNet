@@ -115,7 +115,18 @@ npx @misaka-net/misakanet-setup --verify      # READY / NOT READY / could not ve
                                              #  written); one failing does not condemn the other, and a file
                                              #  we cannot write says 装不了 with its cause — not 没装 with
                                              #  the one fix that cannot work ("re-run the installer")
-npx @misaka-net/misakanet-setup --only claude # one agent only
+                                             #  安装完整性 is grouped per client, one verdict line each
+                                             #  (就绪 / 装不了 / 没装过 / 装坏了), because the checks were
+                                             #  per client all along and one broken assistant must not
+                                             #  condemn the healthy one
+npx @misaka-net/misakanet-setup --only claude # one agent only (what to install)
+npx @misaka-net/misakanet-setup --client openclaw --verify
+                                             # judge ONE client only: the others are not checked, not
+                                             #  printed and not counted — on a multi-client machine the
+                                             #  question is "how is the one I use". An unknown client is
+                                             #  refused (exit 2) with the supported list.
+                                             #  (--client-id is a different thing: it pins this machine's
+                                             #  pseudonym and has nothing to do with the assistants)
 npx @misaka-net/misakanet-setup --list-writes # only prints what it would write (file | action | how to undo), writes nothing
                                              # (the install preview shows the same list; this one is for an operator who
                                              #  has to approve it before it happens)
