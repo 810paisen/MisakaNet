@@ -3386,3 +3386,108 @@ test('--report tells "only tier ①" apart from "nothing installed"', () => {
   const fullReport = runOffline(full, '--report', '--only', 'claude');
   assert.match(fullReport.stdout, /^install-scope: full$/m, fullReport.stdout);
 });
+
+// ── #3699: the conclusion is per client, and one client can be judged on its own ─────────────────
+//
+// The checks in `--verify` were per client all along — each block reads one assistant's own
+// files — but the verdict was per machine: on a machine with two assistants, one broken assistant
+// condemned both, and the healthy one was indistinguishable from the broken one. The OpenClaw
+// trialer read the single verdict as "MisakaNet does not work here" (#3696), and the next
+// question a multi-client machine asks is "how is *the one I use*".
+
+/**
+ * A local endpoint that answers the MCP handshake, so `--verify` can reach a real verdict.
+ * The shape is the one the #3696 test uses: a JSON-RPC answer whose `structuredContent` carries
+ * the tool list.
+ */
+async function startMcpServer() {
+  const { createServer } = await import('node:http');
+  const server = createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      const result = { tools: [{ name: 'misakanet_search' }, { name: 'misakanet_get_lesson' }] };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {
+        content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result } }));
+    });
+  });
+  await new Promise((done) => server.listen(0, '127.0.0.1', done));
+  return { server, url: `http://127.0.0.1:${server.address().port}/mcp` };
+}
+
+const OUR_RULES = '# ours\n\n<!-- misakanet:start -->\nrules\n<!-- misakanet:end -->\n';
+
+/**
+ * A machine with two assistants: Codex, installed correctly, and OpenClaw, whose MCP entry points
+ * at the wrong endpoint. That is the multi-client machine the issue is about — one healthy, one
+ * broken — and it is the only shape in which "one verdict for the machine" says something false.
+ */
+function makeTwoClientHome(endpoint) {
+  const home = mkdtempSync(join(tmpdir(), 'mn-clients-'));
+  mkdirSync(join(home, '.codex'), { recursive: true });
+  writeFileSync(join(home, '.codex', 'AGENTS.md'), OUR_RULES);
+  writeFileSync(join(home, '.codex', 'config.toml'),
+    'model = "gpt-5"\n\nexperimental_use_rmcp_client = true\n\n'
+    + `[mcp_servers.misakanet]\ntype = "streamable-http"\nurl = "${endpoint}"\n`);
+  mkdirSync(join(home, '.openclaw', 'workspace'), { recursive: true });
+  writeFileSync(join(home, '.openclaw', 'workspace', 'AGENTS.md'), OUR_RULES);
+  writeFileSync(join(home, '.openclaw', 'openclaw.json'), JSON.stringify({
+    mcp: { servers: { misakanet: { type: 'streamable-http', url: 'https://BROKEN.invalid/mcp' } } },
+  }, null, 2));
+  return home;
+}
+
+test('verify gives each client its own verdict and names the one that is not ready (issue #3699)', async () => {
+  const { server, url } = await startMcpServer();
+  const home = makeTwoClientHome(url);
+  try {
+    const verify = await runAsync(home, childEnv({ MISAKANET_ENDPOINT: url }), '--verify');
+    const out = verify.stdout;
+    // One line per client: the healthy one says so…
+    assert.match(out, /Codex：就绪/, out);
+    // …and the broken one says what is wrong. Its entry is there and points at the wrong place,
+    // which is neither "not installed" nor "cannot be written" — so it gets its own word.
+    assert.match(out, /OpenClaw：装坏了/, out);
+    // And the machine-level line names the client instead of only counting the open items:
+    // "3 项需要手动处理" never said which assistant the three belonged to.
+    assert.match(out, /安装完整性：不完整 —— OpenClaw：装坏了/, out);
+    assert.equal(verify.status, 1, out);
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('--client judges one client and says nothing about the others (issue #3699)', async () => {
+  const { server, url } = await startMcpServer();
+  const home = makeTwoClientHome(url);
+  try {
+    const only = await runAsync(home, childEnv({ MISAKANET_ENDPOINT: url }), '--verify', '--client', 'codex');
+    assert.equal(only.status, 0, only.stdout + only.stderr);
+    assert.match(only.stdout, /Codex：就绪/, only.stdout);
+    assert.doesNotMatch(only.stdout, /OpenClaw/, only.stdout);
+
+    // Without the filter the broken client is the machine's problem — the old single verdict.
+    const all = await runAsync(home, childEnv({ MISAKANET_ENDPOINT: url }), '--verify');
+    assert.equal(all.status, 1, all.stdout);
+    assert.match(all.stdout, /OpenClaw：装坏了/, all.stdout);
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('--client with an unknown client refuses instead of guessing (issue #3699)', () => {
+  const home = mkdtempSync(join(tmpdir(), 'mn-client-bad-'));
+  try {
+    const result = run(home, '--verify', '--client', 'notaclient');
+    // Exit 2 is this tool's "could not answer" code — the machine is not broken, the request was.
+    assert.equal(result.status, 2, result.stdout + result.stderr);
+    assert.match(result.stderr, /未知的客户端/, result.stderr);
+    assert.match(result.stderr, /Claude Code/, 'the supported list must be named');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+

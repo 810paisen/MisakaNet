@@ -77,6 +77,24 @@ const valueOf = (flag, dflt) => {
   return i >= 0 && args[i + 1] ? args[i + 1] : dflt;
 };
 const only = valueOf('--only', '').split(',').map((s) => s.trim()).filter(Boolean);
+
+/**
+ * `--client <id>`: judge **one** client only (issue #3699).
+ *
+ * The checks in `verify()` are per client — each block reads one assistant's own files — but the
+ * verdict was per machine: on a machine with three assistants, one broken assistant condemned all
+ * three, and a healthy one was indistinguishable from a broken one (#3696). The question a
+ * multi-client machine actually asks is "how is *the one I use*", so this flag answers exactly
+ * that: the other clients are not checked, not printed, and not counted.
+ *
+ * Not to be confused with `--client-id`, which pins this machine's pseudonym and has nothing to do
+ * with the assistants.
+ */
+const CLIENT = valueOf('--client', '').trim().toLowerCase();
+
+/** Should this client's checks run? A `--client` filter narrows the whole run down to one. */
+const wantClient = (id) => !CLIENT || CLIENT === id;
+
 const DRY = has('--dry-run');
 /**
  * Permission tiers (2026-09-18).
@@ -116,12 +134,34 @@ const HOME = resolve(valueOf('--home', homedir()));
 const AGENTS = ['claude', 'codex', 'hermes', 'openclaw', 'codewhale',
                 'cursor', 'gemini', 'copilot', 'opencode', 'kiro', 'mcode'];
 
+/**
+ * The three line lists, and what every line knows about itself.
+ *
+ * A line knows the **client** it is about, and a failure knows its **kind** — what is wrong, which
+ * is what decides the fix (issue #3699). The checks in `verify()` are per client (each block reads
+ * one assistant's own files), but the output could only say "this machine is ready": a machine with
+ * three assistants was condemned because of the one the user never touches, and a healthy assistant
+ * was indistinguishable from a broken one (#3696, #3699).
+ *
+ * The kinds:
+ *   'blocked' — we cannot write there. A re-run writes exactly as much as the last one did, so
+ *               "re-run the install" is not the advice (measured 2026-10-22 on an OpenClaw machine
+ *               whose workspace was root-owned and read-only — see `unwritableAdvice`).
+ *   'absent'  — our footprint is not there at all. A re-run puts it there.
+ *   'broken'  — our footprint is there but wrong (wrong endpoint, missing field). A re-run fixes it.
+ *
+ * The client id is '' for a line that is about the machine rather than about one client: the
+ * endpoint probe, the token, the version stamp.
+ */
 const done = [];
 const manual = [];
 const skipped = [];
-const ok = (m) => done.push(m);
-const need = (m) => manual.push(m);
-const skip = (m) => skipped.push(m);
+const ok = (m, client = '') => done.push({ text: m, client });
+const need = (m, client = '', kind = '') => manual.push({ text: m, client, kind });
+const skip = (m, client = '') => skipped.push({ text: m, client });
+
+/** The display name of a client id — `AGENT_LABELS`, with the id as the fallback. */
+const clientLabel = (id) => AGENT_LABELS[id] || id;
 
 function readJson(path, fallback) {
   try {
@@ -181,6 +221,7 @@ const REFERRAL_SHAPE = /^[A-Za-z0-9]{4,16}$/
 const FLAGS = [
   ['--home <dir>', '把配置写到这个目录，而不是真实家目录（不是沙箱：--uninstall 也认这个目录）'],
   ['--only <a,b>', `只处理列出的助手（${AGENTS.join(' / ')}）`],
+  ['--client <id>', `只检查这一个客户端（${AGENTS.join(' / ')}）——只判它，不判整台机器`],
   ['--dry-run', '只说不做：打印会改哪些文件，不写任何东西'],
   ['--silent', '只压掉进度叙述，绝不压掉 ! 行与报告（MDM/GPO 用）'],
   ['--report', '打印一段可公开粘贴的脱敏状态报告（人读 YAML）'],
@@ -198,7 +239,7 @@ const FLAGS = [
   ['--help, -h', '打印这份帮助并退出'],
   ['--version', '打印版本并退出'],
 ];
-const VALUE_FLAGS = ['--home', '--only', '--client-id'];
+const VALUE_FLAGS = ['--home', '--only', '--client-id', '--client'];
 
 function printHelp() {
   console.log(`MisakaNet 安装程序 ${VERSION}
@@ -1055,6 +1096,35 @@ function expectedEndpoint() {
   const fromEnv = (process.env.MISAKANET_ENDPOINT || '').trim();
   if (fromEnv) return fromEnv;
   return CANONICAL_ENDPOINT;
+}
+
+/**
+ * The endpoint URL in a Hermes config's `mcp_servers.misakanet` entry.
+ *
+ * Hermes' config is YAML and this installer has no YAML parser, so the URL is read the way it is
+ * written: the `url:` line of the `misakanet:` block. Both shapes put it there — the block this
+ * installer writes (marked with the comment pair) and the bare entry a user added through the
+ * Hermes CLI.
+ */
+function hermesMcpUrl(text) {
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i += 1) {
+    const head = lines[i].match(/^([ \t]*)misakanet:/);
+    if (!head) continue;
+    const indent = head[1].length;
+    // The entry's own keys are indented deeper than the `misakanet:` line; the first line that is
+    // not ends the entry, and the next entry's `url:` must not be read as this one's.
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const line = lines[j];
+      if (!line.trim()) continue;
+      const lineIndent = line.match(/^[ \t]*/)[0].length;
+      if (lineIndent <= indent) break;
+      const url = line.match(/^[ \t]*url:[ \t]*(.+?)[ \t]*$/);
+      // The quotes are optional in YAML, and a user-added entry may well have them.
+      if (url) return url[1].replace(/^["']|["']$/g, '');
+    }
+  }
+  return '';
 }
 
 /**
@@ -2304,6 +2374,21 @@ async function verify() {
   // footprint, and it says nothing about the endpoint.
   let installOk = true;
   const installFailed = () => { installOk = false; allOk = false; };
+  /**
+   * A check whose answer is "we cannot write there" or "our footprint is not there".
+   *
+   * The two answers have different fixes, and the per-client summary has to name which one it is:
+   * a read-only target is **not** fixed by re-running the installer — a re-run writes exactly as
+   * much as the last one did (measured 2026-10-22 on an OpenClaw machine whose workspace was
+   * root-owned and read-only; see `unwritableAdvice`). So the kind is decided **here**, where the
+   * writability is measured, and never by reading the wording of the message: a message that
+   * changes its phrasing must not silently change the verdict.
+   */
+  const needWrite = (client, path, absentMsg, blockedMsg) => {
+    installFailed();
+    if (canCreateHere(path)) need(absentMsg, client, 'absent');
+    else need(blockedMsg, client, 'blocked');
+  };
   // Where each segment starts, in the three line lists. The output prints the two segments as
   // two sections, and this boundary is the only thing that has to be right about them.
   const segmentStart = { done: done.length, manual: manual.length, skipped: skipped.length };
@@ -2325,13 +2410,16 @@ async function verify() {
     try {
       const granted = readJson(join(HOME, '.claude', 'settings.json'), null)?.permissions?.allow || [];
       const missing = CLAUDE_ALLOWED_TOOLS.filter((tool) => !granted.includes(tool));
-      if (claudeCodeInUse() && missing.length) {
+      if (wantClient('claude') && claudeCodeInUse() && missing.length) {
         allOk = false;
         // Not an install fact: the endpoint answers, and the search still fails. It belongs to
         // the usability segment, so it belongs there in the output too.
         usable = false;
+        // It is a Claude Code fact all the same — the permission list is Claude Code's own
+        // config — so it is judged under Claude Code and not under the machine (#3699). The fix
+        // is the same re-run, which is what 'absent' means: the grant is not in the list yet.
         need(`Claude Code：只读 MCP 工具没有放行（${missing.length} 个）→ 第一次检索会被权限拦下；`
-          + '重跑安装命令即可放行');
+          + '重跑安装命令即可放行', 'claude', 'absent');
       }
     } catch { /* a settings file we cannot read is reported by the Claude checks below */ }
   } else if (outcome.state === 'non-mcp') {
@@ -2380,11 +2468,20 @@ async function verify() {
   // self-contradiction the issue was filed for (`detected-agents: []` next to
   // `install-complete: complete`). Judged on "no target in AGENTS is detected", not on one
   // hard-coded directory: any of the supported assistants in `AGENTS` counts.
-  const detectedAgents = AGENTS.filter((agent) => detect(agent));
+  // `detected-agents` counts only the assistants in scope: with `--client <id>` the question is
+  // about that one, so another assistant's absence is not this machine's problem (#3699).
+  const detectedAgents = AGENTS.filter((agent) => wantClient(agent) && detect(agent));
   if (!detectedAgents.length) {
     installFailed();
-    need('没有检测到任何受支持的助手 —— 因此什么都没装'
-      + `（支持：${supportedAgentLabels()}）→ 先打开一次你要用的那个助手，再回来运行本命令`);
+    if (CLIENT) {
+      // The user named a client this machine does not have. That is an answer, not a silence:
+      // "OpenClaw：没装过（这台机器上没检测到它）" says what to do about it.
+      need(`${clientLabel(CLIENT)}：没装过（这台机器上没检测到它）`
+        + '→ 先打开一次那个助手，再回来运行本命令', CLIENT, 'absent');
+    } else {
+      need('没有检测到任何受支持的助手 —— 因此什么都没装'
+        + `（支持：${supportedAgentLabels()}）→ 先打开一次你要用的那个助手，再回来运行本命令`);
+    }
   }
   const tokenFile = join(stateDir(), 'token');
   let tokenPresent = '';
@@ -2408,7 +2505,7 @@ async function verify() {
   // Cursor-only install reported NOT READY with two Claude Code complaints about a target that was
   // never selected — the same lie the OpenClaw and Hermes checks below already refuse to tell
   // (found while adding Cursor, which is mcp-only by construction).
-  if (claudeCodeInUse()) {
+  if (wantClient('claude') && claudeCodeInUse()) {
     const hookPath = join(stateDir(), 'hook.mjs');
     let hookPresent = false;
     try {
@@ -2417,10 +2514,9 @@ async function verify() {
       hookPresent = false;
     }
     if (!hookPresent) {
-      installFailed();
-      need(canCreateHere(hookPath)
-        ? '自动沉淀钩子：缺失 → 重跑安装命令'
-        : `自动沉淀钩子：装不了（${hookPath}）→ ${unwritableAdvice()}`);
+      needWrite('claude', hookPath,
+        '自动沉淀钩子：缺失 → 重跑安装命令',
+        `自动沉淀钩子：装不了（${hookPath}）→ ${unwritableAdvice()}`);
     } else {
       const settingsPath = join(HOME, '.claude', 'settings.json');
       const settings = readJson(settingsPath, {}) || {};
@@ -2431,34 +2527,35 @@ async function verify() {
         .filter((c) => typeof c === 'string');
       if (!commands.length) {
         installFailed();
-        need('Claude Code：钩子没装（settings.json 里没有本安装器写入的命令）');
+        need('Claude Code：钩子没装（settings.json 里没有本安装器写入的命令）', 'claude', 'absent');
       } else {
         const exe = commands[0].startsWith('"') ? commands[0].split('"')[1] : commands[0].split(' ')[0];
         if (!existsSync(exe)) {
           installFailed();
-          need(`Claude Code：钩子里的解释器不存在（${exe}）→ 钩子永远不会触发，重跑安装命令即可修`);
+          need(`Claude Code：钩子里的解释器不存在（${exe}）→ 钩子永远不会触发，重跑安装命令即可修`,
+            'claude', 'broken');
         } else {
-          ok('Claude Code：钩子已装且解释器存在');
+          ok('Claude Code：钩子已装且解释器存在', 'claude');
         }
       }
       const cfg = join(HOME, '.claude.json');
       const data = readJson(cfg, {}) || {};
       const entry = data.mcpServers?.misakanet;
       if (!entry) {
-        installFailed();
-        need(canCreateHere(cfg)
-          ? `Claude Code：MCP 未注册（${cfg}）`
-          : `Claude Code：MCP 未注册（${cfg}）→ ${unwritableAdvice()}`);
+        needWrite('claude', cfg,
+          `Claude Code：MCP 未注册（${cfg}）`,
+          `Claude Code：MCP 未注册（${cfg}）→ ${unwritableAdvice()}`);
       } else {
         const verdict = mcpEntryState(entry, 'url');
         if (verdict.state === 'wrong-url') {
           installFailed();
-          need(`Claude Code：MCP 条目指向的端点不对（${verdict.url}，应为 ${verdict.expected}）（${cfg}）→ 重跑安装命令`);
+          need(`Claude Code：MCP 条目指向的端点不对（${verdict.url}，应为 ${verdict.expected}）（${cfg}）→ 重跑安装命令`,
+            'claude', 'broken');
         } else if (verdict.state === 'no-url-field') {
           installFailed();
-          need(`Claude Code：MCP 条目在，但没有 url 字段（${cfg}）→ 重跑安装命令`);
+          need(`Claude Code：MCP 条目在，但没有 url 字段（${cfg}）→ 重跑安装命令`, 'claude', 'broken');
         } else {
-          ok(`Claude Code：MCP 已注册（${verdict.url}）`);
+          ok(`Claude Code：MCP 已注册（${verdict.url}）`, 'claude');
         }
       }
     }
@@ -2467,57 +2564,84 @@ async function verify() {
   // OpenClaw that it is "not ready" would be a lie about a target that was never selected.
   // The state is read from the same file `openclaw mcp list` reports from, which keeps this
   // check working where the CLI itself cannot start (its database may be unwritable).
-  if (detect('openclaw')) {
+  if (wantClient('openclaw') && detect('openclaw')) {
     const rules = join(openclawWorkspaces()[0], 'AGENTS.md');
     if (!readText(rules).includes(`<!-- ${START} -->`)) {
-      installFailed();
       // "没装" and "装不了" are different facts with different fixes, and the difference is the
       // whole point (issue #3696): a read-only workspace is not something a re-run installs.
-      need(canCreateHere(rules)
-        ? `OpenClaw：规则块没装（${rules}）→ 重跑安装命令`
-        : `OpenClaw：规则块装不了（${rules}）→ ${unwritableAdvice()}`);
+      needWrite('openclaw', rules,
+        `OpenClaw：规则块没装（${rules}）→ 重跑安装命令`,
+        `OpenClaw：规则块装不了（${rules}）→ ${unwritableAdvice()}`);
     } else {
-      ok('OpenClaw：规则块已装');
+      ok('OpenClaw：规则块已装', 'openclaw');
     }
     const cfg = join(HOME, '.openclaw', 'openclaw.json');
     const entry = (readJson(cfg, null) || {}).mcp?.servers?.misakanet;
     if (!entry) {
-      installFailed();
       const manual = `openclaw mcp add misakanet --url ${ENDPOINT} --transport streamable-http`;
-      need(canCreateHere(cfg)
-        ? `OpenClaw：MCP 未注册（${cfg}）→ 重跑安装命令，或手动执行 ${manual}`
-        : `OpenClaw：MCP 未注册（${cfg}）→ ${unwritableAdvice(manual)}`);
+      needWrite('openclaw', cfg,
+        `OpenClaw：MCP 未注册（${cfg}）→ 重跑安装命令，或手动执行 ${manual}`,
+        `OpenClaw：MCP 未注册（${cfg}）→ ${unwritableAdvice(manual)}`);
     } else {
-      ok(`OpenClaw：MCP 已注册（${entry.url || '?'}）`);
+      // The URL is checked here, and it was not: this block only ever asked "is there an entry",
+      // so an OpenClaw pointed at `https://BROKEN.invalid/mcp` was reported as "已注册" with the
+      // unreachable URL printed next to the tick. `mcpEntryState` exists for exactly this and was
+      // simply never applied here (it is applied to Claude, Codex, codewhale, the MCP-only
+      // targets and mcode). With a per-client verdict on screen, "就绪" next to an entry nobody
+      // can reach would be a false green (#1984).
+      const verdict = mcpEntryState(entry, 'url');
+      if (verdict.state === 'wrong-url') {
+        installFailed();
+        need(`OpenClaw：MCP 条目指向的端点不对（${verdict.url}，应为 ${verdict.expected}）（${cfg}）→ 重跑安装命令`,
+          'openclaw', 'broken');
+      } else if (verdict.state === 'no-url-field') {
+        installFailed();
+        need(`OpenClaw：MCP 条目在，但没有 url 字段（${cfg}）→ 重跑安装命令`, 'openclaw', 'broken');
+      } else {
+        ok(`OpenClaw：MCP 已注册（${verdict.url}）`, 'openclaw');
+      }
     }
   }
   // Hermes: same rule — reported only when the user has it. Its config file *is* the registry,
   // so the state is readable without running anything. What cannot be confirmed from here is
   // whether Hermes has loaded that file, and the output says so rather than implying it.
-  if (readText(join(HOME, '.hermes', 'config.yaml'))) {
+  if (wantClient('hermes') && readText(join(HOME, '.hermes', 'config.yaml'))) {
     const rules = join(HOME, '.hermes', 'SOUL.md');
     if (!readText(rules).includes(`<!-- ${START} -->`)) {
-      installFailed();
-      need(canCreateHere(rules)
-        ? `Hermes：规则块没装（${rules}）→ 重跑安装命令`
-        : `Hermes：规则块装不了（${rules}）→ ${unwritableAdvice()}`);
+      needWrite('hermes', rules,
+        `Hermes：规则块没装（${rules}）→ 重跑安装命令`,
+        `Hermes：规则块装不了（${rules}）→ ${unwritableAdvice()}`);
     } else {
-      ok('Hermes：规则块已装');
+      ok('Hermes：规则块已装', 'hermes');
     }
     const cfg = join(HOME, '.hermes', 'config.yaml');
     const text = readText(cfg);
     if (!HERMES_MARKED.test(text) && !HERMES_BARE.test(text)) {
-      installFailed();
       const manual = `hermes mcp add misakanet --url ${ENDPOINT} --auth header`;
-      need(canCreateHere(cfg)
-        ? `Hermes：MCP 未注册（${cfg}）→ 重跑安装命令，或执行 ${manual}`
-        : `Hermes：MCP 未注册（${cfg}）→ ${unwritableAdvice(manual)}`);
-    } else if (!new RegExp(`^${HERMES_ENV_KEY}=`, 'm').test(readText(join(HOME, '.hermes', '.env')))) {
-      ok('Hermes：MCP 条目已写入配置（无 token → 读不限次数，写入类工具不可用）');
-      skip(`Hermes：想让写入类工具可用（write_lesson），重跑安装命令即可写入 ${HERMES_ENV_KEY}`);
+      needWrite('hermes', cfg,
+        `Hermes：MCP 未注册（${cfg}）→ 重跑安装命令，或执行 ${manual}`,
+        `Hermes：MCP 未注册（${cfg}）→ ${unwritableAdvice(manual)}`);
     } else {
-      ok(`Hermes：MCP 条目与 token 都在（${HERMES_ENV_KEY}）`);
-      skip('Hermes：本进程只能确认"配置已写"，无法确认 Hermes 是否已加载 → 可用 hermes mcp list 复核');
+      // The entry is there — but is it pointed at our endpoint? Same gap as OpenClaw had: the
+      // check asked "is there an entry" and never "does it point at the right place", so a Hermes
+      // on `https://BROKEN.invalid/mcp` was reported as registered (#1984: a green run is not
+      // evidence unless something in it can differ).
+      const url = hermesMcpUrl(text);
+      const expected = expectedEndpoint();
+      if (url && url !== expected) {
+        installFailed();
+        need(`Hermes：MCP 条目指向的端点不对（${url}，应为 ${expected}）（${cfg}）→ 重跑安装命令`,
+          'hermes', 'broken');
+      } else if (!url) {
+        installFailed();
+        need(`Hermes：MCP 条目在，但没有 url 字段（${cfg}）→ 重跑安装命令`, 'hermes', 'broken');
+      } else if (!new RegExp(`^${HERMES_ENV_KEY}=`, 'm').test(readText(join(HOME, '.hermes', '.env')))) {
+        ok('Hermes：MCP 条目已写入配置（无 token → 读不限次数，写入类工具不可用）', 'hermes');
+        skip(`Hermes：想让写入类工具可用（write_lesson），重跑安装命令即可写入 ${HERMES_ENV_KEY}`, 'hermes');
+      } else {
+        ok(`Hermes：MCP 条目与 token 都在（${HERMES_ENV_KEY}）`, 'hermes');
+        skip('Hermes：本进程只能确认"配置已写"，无法确认 Hermes 是否已加载 → 可用 hermes mcp list 复核', 'hermes');
+      }
     }
   }
   // Codex and codewhale: reported only when the user has them, like every other target. They were
@@ -2525,68 +2649,67 @@ async function verify() {
   // all, so a machine whose Codex entry pointed at `https://BROKEN.invalid/mcp` and whose rules
   // block had lost its markers still reported READY with exit code 0 — while `--report`'s
   // `detected-agents` listed codex and codewhale as present, and the gate let it through.
-  if (detect('codex')) {
+  if (wantClient('codex') && detect('codex')) {
     const rules = join(HOME, '.codex', 'AGENTS.md');
     if (!readText(rules).includes(`<!-- ${START} -->`)) {
-      installFailed();
-      need(canCreateHere(rules)
-        ? `Codex：规则块没装（${rules}）→ 重跑安装命令`
-        : `Codex：规则块装不了（${rules}）→ ${unwritableAdvice()}`);
+      needWrite('codex', rules,
+        `Codex：规则块没装（${rules}）→ 重跑安装命令`,
+        `Codex：规则块装不了（${rules}）→ ${unwritableAdvice()}`);
     } else {
-      ok('Codex：规则块已装');
+      ok('Codex：规则块已装', 'codex');
     }
     const cfg = join(HOME, '.codex', 'config.toml');
     const toml = readText(cfg);
     const table = codexMisakanetTable(toml);
     const verdict = mcpEntryState(table, 'url');
     if (verdict.state === 'missing') {
-      installFailed();
-      need(canCreateHere(cfg)
-        ? `Codex：MCP 未注册（${cfg}）→ 重跑安装命令`
-        : `Codex：MCP 未注册（${cfg}）→ ${unwritableAdvice()}`);
+      needWrite('codex', cfg,
+        `Codex：MCP 未注册（${cfg}）→ 重跑安装命令`,
+        `Codex：MCP 未注册（${cfg}）→ ${unwritableAdvice()}`);
     } else if (verdict.state === 'wrong-url') {
       installFailed();
-      need(`Codex：MCP 条目指向的端点不对（${verdict.url}，应为 ${verdict.expected}）（${cfg}）→ 重跑安装命令`);
+      need(`Codex：MCP 条目指向的端点不对（${verdict.url}，应为 ${verdict.expected}）（${cfg}）→ 重跑安装命令`,
+        'codex', 'broken');
     } else if (verdict.state === 'no-url-field') {
       installFailed();
-      need(`Codex：MCP 条目在，但没有 url 字段（${cfg}）→ 重跑安装命令`);
+      need(`Codex：MCP 条目在，但没有 url 字段（${cfg}）→ 重跑安装命令`, 'codex', 'broken');
     } else {
-      ok(`Codex：MCP 已注册（${verdict.url}）`);
+      ok(`Codex：MCP 已注册（${verdict.url}）`, 'codex');
     }
     // The top-level key is what makes Codex speak streamable-http at all: without it the entry
     // above is present and still unusable.
     if (!hasTopLevelKey(toml, 'experimental_use_rmcp_client')) {
       installFailed();
       need(`Codex：config.toml 里没有顶级键 experimental_use_rmcp_client（${cfg}）`
-        + '→ Codex 连不上 streamable-http，重跑安装命令即可补上');
+        + '→ Codex 连不上 streamable-http，重跑安装命令即可补上', 'codex', 'broken');
     }
   }
-  if (detect('codewhale')) {
+  if (wantClient('codewhale') && detect('codewhale')) {
     const cfg = join(HOME, '.codewhale', 'mcp.json');
     const entry = (readJson(cfg, null) || {}).servers?.misakanet;
     const verdict = mcpEntryState(entry, 'url');
     if (verdict.state === 'missing') {
-      installFailed();
-      need(canCreateHere(cfg)
-        ? `codewhale：MCP 未注册（${cfg}）→ 重跑安装命令`
-        : `codewhale：MCP 未注册（${cfg}）→ ${unwritableAdvice()}`);
+      needWrite('codewhale', cfg,
+        `codewhale：MCP 未注册（${cfg}）→ 重跑安装命令`,
+        `codewhale：MCP 未注册（${cfg}）→ ${unwritableAdvice()}`);
     } else if (verdict.state === 'wrong-url') {
       installFailed();
-      need(`codewhale：MCP 条目指向的端点不对（${verdict.url}，应为 ${verdict.expected}）（${cfg}）→ 重跑安装命令`);
+      need(`codewhale：MCP 条目指向的端点不对（${verdict.url}，应为 ${verdict.expected}）（${cfg}）→ 重跑安装命令`,
+        'codewhale', 'broken');
     } else if (verdict.state === 'no-url-field') {
       installFailed();
-      need(`codewhale：MCP 条目在，但没有 url 字段（${cfg}）→ 重跑安装命令`);
+      need(`codewhale：MCP 条目在，但没有 url 字段（${cfg}）→ 重跑安装命令`, 'codewhale', 'broken');
     } else {
-      ok(`codewhale：MCP 已注册（${verdict.url}）`);
+      ok(`codewhale：MCP 已注册（${verdict.url}）`, 'codewhale');
     }
     // Its rules blocks live in the projects it trusts, so that is where they are checked.
     for (const project of codewhaleProjects()) {
       const rules = join(project, 'AGENTS.md');
       if (!readText(rules).includes(`<!-- ${START} -->`)) {
         installFailed();
-        need(`codewhale：规则块没装（${rules}）→ 重跑安装命令`);
+        need(`codewhale：规则块没装（${rules}）→ 重跑安装命令`, 'codewhale', 'absent');
       } else {
-        ok(`codewhale：规则块已装（${rules}）`);
+        ok(`codewhale：规则块已装（${rules}）`, 'codewhale');
       }
     }
   }
@@ -2594,26 +2717,27 @@ async function verify() {
   // Hermes. Their state is one JSON file, so it is readable without starting anything — but whether
   // the client has *loaded* that file cannot be confirmed from here, and the line says so.
   for (const [agent, spec] of Object.entries(MCP_ONLY_TARGETS)) {
-    if (!detect(agent)) continue;
+    if (!wantClient(agent) || !detect(agent)) continue;
     const cfg = spec.config(HOME);
     const entry = (readJson(cfg, null) || {})[spec.container]?.misakanet;
     if (!entry) {
-      installFailed();
-      need(canCreateHere(cfg)
-        ? `${spec.label}：MCP 未注册（${cfg}）→ 重跑安装命令，然后${spec.verifyHint}`
-        : `${spec.label}：MCP 未注册（${cfg}）→ ${unwritableAdvice()}`);
+      needWrite(agent, cfg,
+        `${spec.label}：MCP 未注册（${cfg}）→ 重跑安装命令，然后${spec.verifyHint}`,
+        `${spec.label}：MCP 未注册（${cfg}）→ ${unwritableAdvice()}`);
     } else {
       const verdict = mcpEntryState(entry, spec.urlField);
       if (verdict.state === 'no-url-field') {
         installFailed();
         need(`${spec.label}：MCP 条目在，但没有 ${spec.urlField} 字段（${cfg}）→ 重跑安装命令；`
-          + `这家用的是 ${spec.urlField}${spec.container === 'mcp' ? '（注意嵌套在 mcp 而不是 mcpServers 下）' : ''}`);
+          + `这家用的是 ${spec.urlField}${spec.container === 'mcp' ? '（注意嵌套在 mcp 而不是 mcpServers 下）' : ''}`,
+          agent, 'broken');
       } else if (verdict.state === 'wrong-url') {
         installFailed();
-        need(`${spec.label}：MCP 条目指向的端点不对（${verdict.url}，应为 ${verdict.expected}）（${cfg}）→ 重跑安装命令`);
+        need(`${spec.label}：MCP 条目指向的端点不对（${verdict.url}，应为 ${verdict.expected}）（${cfg}）→ 重跑安装命令`,
+          agent, 'broken');
       } else {
-        ok(`${spec.label}：MCP 已注册（${verdict.url}）`);
-        skip(`${spec.label}：只能确认"配置已写"，无法确认它是否已加载 → ${spec.verifyHint}`);
+        ok(`${spec.label}：MCP 已注册（${verdict.url}）`, agent);
+        skip(`${spec.label}：只能确认"配置已写"，无法确认它是否已加载 → ${spec.verifyHint}`, agent);
       }
     }
   }
@@ -2622,39 +2746,38 @@ async function verify() {
   // hand-edit turned into `{}` is exactly the state a re-run fixes. `mcode plugin add` refuses
   // local plugins on purpose (LOCAL_PLUGIN_INSTALL_UNSUPPORTED), so its exit code is not evidence
   // either way — the directory is, and that is what this reads.
-  if (detect('mcode')) {
+  if (wantClient('mcode') && detect('mcode')) {
     const rules = join(HOME, MCODE_RULES_REL);
     if (!readText(rules).includes(`<!-- ${START} -->`)) {
-      installFailed();
-      need(canCreateHere(rules)
-        ? `MiniMax Code：规则块没装（${rules}）→ 重跑安装命令`
-        : `MiniMax Code：规则块装不了（${rules}）→ ${unwritableAdvice()}`);
+      needWrite('mcode', rules,
+        `MiniMax Code：规则块没装（${rules}）→ 重跑安装命令`,
+        `MiniMax Code：规则块装不了（${rules}）→ ${unwritableAdvice()}`);
     } else {
-      ok('MiniMax Code：规则块已装');
+      ok('MiniMax Code：规则块已装', 'mcode');
     }
     const plugin = mcodePluginPath(HOME);
     const doc = readJson(plugin, null);
     if (doc === null) {
-      installFailed();
-      need(canCreateHere(plugin)
-        ? `MiniMax Code：插件清单缺失或不是合法 JSON（${plugin}）→ 重跑安装命令`
-        : `MiniMax Code：插件清单装不了（${plugin}）→ ${unwritableAdvice()}`);
+      needWrite('mcode', plugin,
+        `MiniMax Code：插件清单缺失或不是合法 JSON（${plugin}）→ 重跑安装命令`,
+        `MiniMax Code：插件清单装不了（${plugin}）→ ${unwritableAdvice()}`);
     } else {
       const verdict = mcpEntryState(doc.mcpServers?.misakanet, 'url');
       if (verdict.state === 'missing') {
         installFailed();
-        need(`MiniMax Code：插件清单里没有 mcpServers.misakanet（${plugin}）→ 重跑安装命令`);
+        need(`MiniMax Code：插件清单里没有 mcpServers.misakanet（${plugin}）→ 重跑安装命令`,
+          'mcode', 'absent');
       } else if (verdict.state === 'no-url-field') {
         installFailed();
-        need(`MiniMax Code：插件清单里的条目没有 url 字段（${plugin}）→ 重跑安装命令`);
+        need(`MiniMax Code：插件清单里的条目没有 url 字段（${plugin}）→ 重跑安装命令`, 'mcode', 'broken');
       } else if (verdict.state === 'wrong-url') {
         installFailed();
         need(`MiniMax Code：插件清单指向的端点不对（${verdict.url}，应为 ${verdict.expected}）（${plugin}）`
-          + '→ 重跑安装命令');
+          + '→ 重跑安装命令', 'mcode', 'broken');
       } else {
-        ok(`MiniMax Code：插件清单已注册（${verdict.url}）`);
+        ok(`MiniMax Code：插件清单已注册（${verdict.url}）`, 'mcode');
         skip('MiniMax Code：只能确认"插件目录在位"，无法确认 mcode 是否已加载 → 跑 `mcode plugin list` 复核'
-          + '（`mcode plugin add` 报 LOCAL_PLUGIN_INSTALL_UNSUPPORTED 不是失败）');
+          + '（`mcode plugin add` 报 LOCAL_PLUGIN_INSTALL_UNSUPPORTED 不是失败）', 'mcode');
       }
     }
   }
@@ -2694,6 +2817,10 @@ async function verify() {
     // The install segment's open items, counted on their own: the report's `open-items` is every
     // manual item, this is the ones that belong to our footprint.
     openItems: manual.length - segmentEnd.manual,
+    // One verdict per client, so the conclusion can be read per assistant instead of per machine
+    // (issue #3699). The machine-level verdict below is derived from these, not the other way
+    // round: a client that was not checked cannot be the reason this machine is not ready.
+    clients: clientVerdicts(),
     segments: { start: segmentStart, end: segmentEnd },
   };
 }
@@ -2725,6 +2852,14 @@ function usabilityText(verdict) {
 }
 
 function installText(verdict) {
+  // The clients that are not ready, **by name** (issue #3699). "3 项需要手动处理" said how many;
+  // it never said which assistant the three belonged to, so on a multi-client machine the reader
+  // had to go and match the count against the lines above.
+  const notReady = (verdict.clients || []).filter((c) => c.verdict !== '就绪');
+  if (notReady.length) {
+    return `不完整 —— ${notReady.map((c) => `${c.label}：${c.verdict}`).join('；')}`
+      + '（上面每条 ! 都给了成因和做法）';
+  }
   if (verdict.zeroTargets) {
     return '不完整 —— 没有检测到任何受支持的助手，因此什么都没装';
   }
@@ -2751,31 +2886,117 @@ function exitCodeFor(verdict) {
 }
 
 /**
+ * One verdict per client, from the lines that client produced (issue #3699).
+ *
+ * The machine-level verdict was a single boolean over every check, but the checks are per client:
+ * a machine with three assistants was condemned because of the one the user never touches, and a
+ * healthy assistant was indistinguishable from a broken one (#3696, #3699). So the conclusion is
+ * per client — and each client gets one of four words, because the four fixes are four different
+ * things:
+ *
+ *   就绪    — everything we checked for this client passed; there is nothing to do.
+ *   装不了  — we cannot write there. Fix the permissions: a re-run writes exactly as much as the
+ *             last one did (measured 2026-10-22 on an OpenClaw machine whose workspace was
+ *             root-owned and read-only — see `unwritableAdvice`).
+ *   没装过  — our footprint is not there: the file, the entry, the permission grant. A re-run puts
+ *             it there.
+ *   装坏了  — our footprint is there but points at the wrong place: the wrong endpoint, a missing
+ *             field, a missing interpreter. A re-run fixes it.
+ *
+ * Issue #3699 names the first three. The fourth exists because "our entry is there and points at
+ * the wrong endpoint" is none of the three, and calling it 没装过 would be a lie about the
+ * machine.
+ *
+ * `blocked` wins over `broken` wins over `absent`: a client we cannot write to is not merely "not
+ * installed", and saying so would send the reader after the wrong fix.
+ */
+const CLIENT_VERDICT_WORDS = { blocked: '装不了', broken: '装坏了', absent: '没装过' };
+/** What to do about each verdict, in the order the fix differs. */
+const CLIENT_VERDICT_HINTS = {
+  就绪: '',
+  装不了: '（改权限后重跑安装命令）',
+  没装过: '（重跑安装命令）',
+  装坏了: '（重跑安装命令）',
+};
+
+function clientVerdicts() {
+  const buckets = new Map();
+  const bucket = (id) => {
+    if (!buckets.has(id)) {
+      buckets.set(id, { id, done: [], manual: [], skipped: [], kinds: new Set() });
+    }
+    return buckets.get(id);
+  };
+  for (const line of done) if (line.client) bucket(line.client).done.push(line);
+  for (const line of manual) {
+    if (!line.client) continue;
+    const b = bucket(line.client);
+    b.manual.push(line);
+    if (line.kind) b.kinds.add(line.kind);
+  }
+  for (const line of skipped) if (line.client) bucket(line.client).skipped.push(line);
+  // `AGENTS` is the order, so the output reads the same way on every machine.
+  return AGENTS.filter((id) => buckets.has(id)).map((id) => {
+    const b = buckets.get(id);
+    const verdict = !b.kinds.size ? '就绪'
+      : b.kinds.has('blocked') ? CLIENT_VERDICT_WORDS.blocked
+        : b.kinds.has('broken') ? CLIENT_VERDICT_WORDS.broken
+          : CLIENT_VERDICT_WORDS.absent;
+    return {
+      id,
+      label: clientLabel(id),
+      verdict,
+      hint: CLIENT_VERDICT_HINTS[verdict],
+      done: b.done,
+      manual: b.manual,
+      skipped: b.skipped,
+    };
+  });
+}
+
+/**
  * The verify output: two sections, because the two questions have two answers.
  *
  * The old output was one list, and one list cannot say "the endpoint answered, the files did not
  * get written" — it can only say NOT READY, which is the sentence the OpenClaw trialer read as
  * "MisakaNet does not work here" (issue #3696).
+ *
+ * The install section is grouped **per client** (issue #3699). The checks were per client all
+ * along — each block reads one assistant's own files — but the output could only say "this
+ * machine", so a machine with three assistants was condemned because of the one the user never
+ * touches, and a healthy assistant was indistinguishable from a broken one. Now each client gets
+ * one verdict line and its own details under it.
  */
 function renderVerify(verdict) {
   const { start, end } = verdict.segments;
   const tail = { done: done.length, manual: manual.length, skipped: skipped.length };
-  const section = (label, from, to) => {
+  // A line is either about the machine (the endpoint probe, the token, the version stamp) or
+  // about one client. The two never share a line, so the sections can be split by that.
+  const machineLines = (list, from, to) => list.slice(from, to).filter((l) => !l.client);
+  const section = (label, from, to, clients) => {
     const out = [];
-    const finished = done.slice(from.done, to.done);
-    const open = manual.slice(from.manual, to.manual);
-    const ignored = skipped.slice(from.skipped, to.skipped);
+    const finished = machineLines(done, from.done, to.done);
+    const open = machineLines(manual, from.manual, to.manual);
+    const ignored = machineLines(skipped, from.skipped, to.skipped);
     // `--silent` drops the narration, never the errors (the same contract `render()` keeps): the
     // `!` lines are what a human has to act on, the `✓` and `·` lines are progress.
-    if (finished.length && !SILENT) out.push(...finished.map((l) => `  ✓ ${l}`));
-    if (open.length) out.push(...open.map((l) => `  ! ${l}`));
-    if (ignored.length && !SILENT) out.push(...ignored.map((l) => `  · ${l}`));
+    if (finished.length && !SILENT) out.push(...finished.map((l) => `  ✓ ${l.text}`));
+    if (open.length) out.push(...open.map((l) => `  ! ${l.text}`));
+    if (ignored.length && !SILENT) out.push(...ignored.map((l) => `  · ${l.text}`));
+    for (const client of clients || []) {
+      // The verdict line is the conclusion, not narration: it survives `--silent`, because a
+      // silent `--verify` that prints nothing about the client cannot be read at all.
+      out.push(`  ${client.label}：${client.verdict}${client.hint}`);
+      if (client.done.length && !SILENT) out.push(...client.done.map((l) => `    ✓ ${l.text}`));
+      if (client.manual.length) out.push(...client.manual.map((l) => `    ! ${l.text}`));
+      if (client.skipped.length && !SILENT) out.push(...client.skipped.map((l) => `    · ${l.text}`));
+    }
     if (!out.length) return out;
     return [`\n── ${label} ──`, ...out];
   };
   return [
-    ...section('端点/可用性', start, end),
-    ...section('安装完整性', end, tail),
+    ...section('端点/可用性', start, end, []),
+    ...section('安装完整性', end, tail, verdict.clients),
     '',
     `可用性：${usabilityText(verdict)}`,
     `安装完整性：${installText(verdict)}`,
@@ -3205,7 +3426,7 @@ function reportValues(verdict) {
     ['voice', voiceStatus()],
     ['open-items', manual.length],
     // Redacted here, once, so neither encoder can print an unredacted message by accident.
-    ['open-items-detail', manual.map((m) => redact(m))],
+    ['open-items-detail', manual.map((m) => redact(m.text))],
     ...HUMAN_REPORT_FIELDS.map(([key, value, note]) => [key, value, note]),
   ];
 }
@@ -3288,9 +3509,9 @@ function render() {
   // `--silent` drops the narration, never the errors: `done` is progress, `manual` is what a human
   // (or a GPO log reader) has to act on, and a run that failed silently would be worse than a loud
   // one. See SILENT at the top for the full contract.
-  if (done.length && !SILENT) out.push(`\n已完成（${done.length}）:`, ...done.map((l) => `  ✓ ${l}`));
-  if (manual.length) out.push(`\n需要你手动一步（${manual.length}）:`, ...manual.map((l) => `  ! ${l}`));
-  if (skipped.length && !SILENT) out.push(`\n跳过（${skipped.length}）:`, ...skipped.map((l) => `  · ${l}`));
+  if (done.length && !SILENT) out.push(`\n已完成（${done.length}）:`, ...done.map((l) => `  ✓ ${l.text}`));
+  if (manual.length) out.push(`\n需要你手动一步（${manual.length}）:`, ...manual.map((l) => `  ! ${l.text}`));
+  if (skipped.length && !SILENT) out.push(`\n跳过（${skipped.length}）:`, ...skipped.map((l) => `  · ${l.text}`));
   return out.join('\n');
 }
 
@@ -3307,6 +3528,22 @@ const STRICT = has('--strict') || has('--ci');
 const mode = has('--uninstall') ? 'uninstall'
   : ((has('--report') || REPORT_JSON || (has('--ci') && !has('--verify'))) ? 'report'
   : (has('--verify') ? 'verify' : 'install'));
+// `--client` is a question about *judging*, so it belongs to `--verify` and nowhere else: in
+// install mode `--only` already says which assistants to write to, and in report mode the report
+// has its own shape. A flag that silently does nothing is worse than one that refuses: `--client`
+// next to `--client-id` is exactly the kind of pair a user mixes up, so it says what it means.
+// Exit 2 is this tool's "could not answer" code (same as a probe timeout, #3778) — the machine
+// is not broken, the request was.
+if (CLIENT && mode !== 'verify') {
+  console.error(`--client 只对 --verify 有意义（它决定"只判哪一个客户端"）；`
+    + `当前模式是 ${mode}，请用 --only <助手> 指定要处理的助手。`);
+  process.exit(2);
+}
+if (CLIENT && !AGENTS.includes(CLIENT)) {
+  console.error(`未知的客户端：${CLIENT}`);
+  console.error(`支持的客户端：${supportedAgentLabels()}`);
+  process.exit(2);
+}
 if (mode !== 'report' && !SILENT) {
   // The banner names the home directory, which is exactly the kind of thing that gets pasted
   // along with a report — so `--report` prints only the report. `--silent` drops it for the other
