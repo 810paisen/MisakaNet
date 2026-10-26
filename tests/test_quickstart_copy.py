@@ -20,8 +20,12 @@ Four things are pinned here, one per acceptance item:
    never "it should just work".
 3. **The buttons are labelled and keyboard-reachable**: real `<button type="button">`
    elements (native Enter/Space activation) with an `aria-label`.
-4. **No build step and no external JS** was introduced: the handler is inline in the page's
-   existing script, and the only external `<script src>` on the page is still DOMPurify.
+4. **No build step and no third-party JS** was introduced: the handler is inline in the page's
+   existing script, and the only third-party `<script src>` on the page is still DOMPurify. A
+   *same-origin* script is a file this repository ships rather than a dependency on somebody
+   else's server, and it is checked to be a file that exists rather than waved at — the homepage
+   now loads `/js/site.js`, the site's shared escaper and JSON reader (#3694 is what the seven
+   per-page copies cost).
 
 The i18n contract for the new sentences lives in `tests/test_site_i18n.py` (#1894): every
 sentence inside `#quickstart-section` is behind `data-i18n`, and its `zh.json` value is real
@@ -314,14 +318,40 @@ def test_every_copy_button_is_labelled_and_keyboard_reachable():
 
 
 def test_the_copy_handler_is_inline_and_no_external_js_was_added():
-    """The handler ships in the page's existing inline script. The page's only external script
-    is still DOMPurify — no CDN addition, no bundler, no npm."""
+    """The handler ships in the page's existing inline script. The page's only **third-party**
+    script is still DOMPurify — no CDN addition, no bundler, no npm.
+
+    "Third-party" is the word that matters, and the distinction is not cosmetic. A *same-origin*
+    script is a file this repository ships: the page and the script arrive from the same origin,
+    the same deployment, the same cache, and it is reviewed in the same diff. A CDN script is a
+    third party serving bytes this repository does not control, which is why DOMPurify carries an
+    integrity hash (`tests/test_external_asset_integrity.py`) and this one does not need to.
+
+    The homepage loads `/js/site.js` — the site's shared escaper and JSON reader, one copy for
+    every page (#3694 is what the seven copies cost). It is a classic script, not a module, so it
+    has to be a plain `<script src>` before the page's own inline script: a module's scope is not
+    visible to a classic inline script, and a module script is deferred, so it would run after
+    them and every panel that calls the escaper would throw.
+
+    The same-origin half is checked rather than waved at: a `src` that is not a file the
+    repository ships is a page depending on something that is not there, and the browser's answer
+    is a 404 and a `ReferenceError` on the first call.
+    """
     page = INDEX.read_text(encoding="utf-8")
     assert "function copyQS(" in page, "copyQS is not inline in docs/index.html"
     srcs = re.findall(r'<script[^>]*\bsrc="([^"]+)"', page)
-    assert srcs == [
+    third_party = [s for s in srcs if s.startswith(("http://", "https://", "//"))]
+    assert third_party == [
         "https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.4.16/purify.min.js"
-    ], f"external script set changed: {srcs}"
+    ], f"the page's third-party scripts changed: {third_party}"
+    same_origin = [s for s in srcs if not s.startswith(("http://", "https://", "//"))]
+    missing = [
+        s for s in same_origin
+        if not (REPO / "docs" / s.lstrip("/")).is_file()
+    ]
+    assert not missing, (
+        f"the page loads script files this repository does not ship: {missing}"
+    )
     assert not re.search(r"<script[^>]*type=\"module\"", page), "a module script was added"
     pkg = json.loads((REPO / "package.json").read_text(encoding="utf-8"))
     assert "build" not in (pkg.get("scripts") or {}), "a build step appeared in package.json"
