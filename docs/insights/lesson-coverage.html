@@ -263,12 +263,12 @@
   </footer>
 </div>
 
+<!-- The escaper and the JSON reader the site shares: one copy, loaded before this page's
+     script. `docs/js/site.js` is where they live now (they used to be copied into seven
+     pages, and the copies drifted — #3694 is what that cost). -->
+<script src="/js/site.js"></script>
 <script>
 const API = window.location.origin + '/api/insights/lesson-coverage';
-
-function escapeHTML(value) {
-  return String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
 
 function statusLabel(value) {
   return String(value || '').replace('-', ' ');

@@ -169,26 +169,166 @@ def test_a_script_end_tag_may_carry_whitespace(tmp_path, end_tag):
     assert [f["name"] for f in found] == ["escapeHTML"], found
 
 
-def test_the_homepage_defines_the_helpers_its_panels_call():
+def test_the_homepage_loads_the_helpers_its_panels_call():
     """The regression, stated in the plainest words available.
 
     The panel renderers below are the reason the two helpers exist at all: `safeHref` escapes a
     URL, and the footnote, the feed, the history bars and the contributor wall all escape text
-    they interpolate. A page that renders untrusted values needs an escaper, and this is the one
-    it has.
+    they interpolate. A page that renders untrusted values needs an escaper.
+
+    They live in `docs/js/site.js` now — one copy for the whole site — and the homepage loads it
+    before the script that calls them. The copy that used to sit in the page was the copy #3694
+    deleted, and the panels that called it went blank while the API was answering 200.
     """
     html = HOME.read_text(encoding="utf-8")
-    assert "function escapeHTML(val)" in html, (
-        "the homepage renders JSON into markup and no longer defines the escaper it calls"
+    assert 'src="/js/site.js"' in html, (
+        "the homepage renders JSON into markup and no longer loads the escaper it calls"
     )
-    assert "function readJsonResponse(response)" in html, (
-        "every fetch on the homepage ends in readJsonResponse and it is no longer defined"
+    # The page must not keep a copy of its own: two copies are how the copies drifted apart.
+    assert "function escapeHTML(val)" not in html, (
+        "the homepage still carries its own copy of the escaper — that is the shape the shared "
+        "module exists to end"
     )
-    # The two are the same functions /register/ runs: one copy of a rule, two pages.
-    for name in ("escapeHTML", "readJsonResponse"):
-        home = html[html.index(f"function {name}("):]
-        home = home[: home.index("\n}\n") + 3]
-        register = REGISTER.read_text(encoding="utf-8")
-        start = register.index(f"function {name}(")
-        other = register[start: start + len(home)]
-        assert home == other, f"the homepage and /register/ have drifted on {name}"
+    assert "function readJsonResponse(response)" not in html, (
+        "the homepage still carries its own copy of the JSON reader"
+    )
+    module = (SITE / "js" / "site.js").read_text(encoding="utf-8")
+    assert "function escapeHTML(val)" in module, "the shared module must provide the escaper"
+    assert "async function readJsonResponse(response)" in module, (
+        "the shared module must provide the JSON reader"
+    )
+
+
+def test_a_page_that_keeps_its_own_copy_of_a_shared_helper_is_reported(tmp_path):
+    """The second half of the rule: **one** copy, not one per page.
+
+    The seven copies are how they drifted apart: four escaped with `String(value)` (a null
+    printed as the words "null"), one with `String(value || '')` (a count of zero printed as
+    nothing), and two with the `??` form. The gate below says so out loud, so the next copy is a
+    finding rather than a silent divergence.
+    """
+    (tmp_path / "js").mkdir()
+    (tmp_path / "js" / "site.js").write_text(
+        "function escapeHTML(val) { return val; }\n", encoding="utf-8")
+    (tmp_path / "one.html").write_text(
+        "<html><body><script>\n"
+        "function escapeHTML(val) { return val; }\n"
+        "function panel() { return escapeHTML('x'); }\n"
+        "</script></body></html>\n",
+        encoding="utf-8",
+    )
+    found = checker.scan(tmp_path)
+    assert [f["kind"] for f in found] == ["duplicate"], found
+    assert [f["name"] for f in found] == ["escapeHTML"], found
+
+
+def test_a_page_that_loads_the_shared_module_is_not_reported(tmp_path):
+    """The other half: loading the module is how a page gets the helper, and it is not a finding.
+
+    The `src` is absolute (`/js/site.js`), the way the site links to itself everywhere else, so
+    the checker has to resolve it against the **site root** rather than against the page's own
+    directory — the browser resolves it the same way.
+    """
+    (tmp_path / "js").mkdir()
+    (tmp_path / "js" / "site.js").write_text(
+        "function escapeHTML(val) { return val; }\n", encoding="utf-8")
+    (tmp_path / "two.html").write_text(
+        '<html><body><script src="/js/site.js"></script>\n'
+        "<script>\n"
+        "function panel() { return escapeHTML('x'); }\n"
+        "</script></body></html>\n",
+        encoding="utf-8",
+    )
+    assert checker.scan(tmp_path) == []
+
+
+def test_a_local_shadow_of_a_shared_helper_is_not_a_second_copy(tmp_path):
+    """The false-positive direction, which is the one that matters.
+
+    A page that declares `escapeHTML` **inside a function** is shadowing the shared escaper for
+    that function — it is not keeping a second copy of it. A gate that said otherwise would be
+    wrong about ordinary code, and a gate that is wrong about ordinary code teaches every
+    maintainer to ignore it.
+    """
+    (tmp_path / "js").mkdir()
+    (tmp_path / "js" / "site.js").write_text(
+        "function escapeHTML(val) { return val; }\n", encoding="utf-8")
+    (tmp_path / "one.html").write_text(
+        "<html><body><script>\n"
+        "function panel() { const escapeHTML = (v) => v; return escapeHTML('x'); }\n"
+        "</script></body></html>\n",
+        encoding="utf-8",
+    )
+    assert checker.scan(tmp_path) == []
+
+
+def test_the_reverse_test_covers_both_kinds_of_finding():
+    """`scripts/check_page_scripts.py --reverse-test` is the proof that the gate can go red.
+
+    It has two legs — a name called and never defined, and a second copy of a shared helper —
+    and it has to keep both: a gate that can only go red one way is a gate whose green is
+    half a claim.
+    """
+    assert checker._reverse_test(REPO / "docs") == 0
+
+
+def test_a_module_loaded_as_a_module_does_not_provide_the_helper(tmp_path):
+    """A module's scope is private, and a module script is deferred.
+
+    Loading the shared module as `<script type="module" src="/js/site.js">` would leave every page
+    that calls it with an undefined name — the #3694 shape, with the module still sitting on disk
+    and the file still there for a reader to believe in. Nothing else in the repository would say
+    so, so the gate has to.
+    """
+    (tmp_path / "js").mkdir()
+    (tmp_path / "js" / "site.js").write_text(
+        "function escapeHTML(val) { return val; }\n", encoding="utf-8")
+    (tmp_path / "two.html").write_text(
+        '<html><body><script type="module" src="/js/site.js"></script>\n'
+        "<script>\n"
+        "function panel() { return escapeHTML('x'); }\n"
+        "</script></body></html>\n",
+        encoding="utf-8",
+    )
+    found = checker.scan(tmp_path)
+    assert [f["name"] for f in found] == ["escapeHTML"], found
+    assert [f["kind"] for f in found] == ["missing"], found
+
+
+def test_a_loaded_scripts_local_names_are_not_the_pages_names(tmp_path):
+    """A classic script's top-level declarations reach the next script; a function's locals do not.
+
+    The scope rule is the browser's, and getting it wrong in the permissive direction hides a
+    real bug: a page calling a name that only exists inside another script's function throws a
+    `ReferenceError` the first time that line runs.
+    """
+    (tmp_path / "js").mkdir()
+    (tmp_path / "js" / "site.js").write_text(
+        "function helper() { const localOnly = 1; return localOnly; }\n", encoding="utf-8")
+    (tmp_path / "two.html").write_text(
+        '<html><body><script src="/js/site.js"></script>\n'
+        "<script>\n"
+        "function panel() { return localOnly(); }\n"
+        "</script></body></html>\n",
+        encoding="utf-8",
+    )
+    found = checker.scan(tmp_path)
+    assert [f["name"] for f in found] == ["localOnly"], found
+
+
+def test_the_shared_module_is_the_one_the_pages_load():
+    """The copy that is left is the copy every page uses.
+
+    The pages and the module are two files, so they can drift apart again — the way the seven
+    copies did. This pins that the module still is what the pages load, and that it still holds
+    the canonical escape: `??` and not `||`, because `||` turns a count of zero into nothing.
+    """
+    module = (SITE / "js" / "site.js").read_text(encoding="utf-8")
+    assert "String(val ?? '')" in module, (
+        "the canonical escape must keep the `??`: `||` turns a zero into an empty string"
+    )
+    for page in (HOME, REGISTER, SITE / "search" / "index.html"):
+        assert 'src="/js/site.js"' in page.read_text(encoding="utf-8"), (
+            f"{page.name} must load the shared module rather than keep a copy"
+        )
+

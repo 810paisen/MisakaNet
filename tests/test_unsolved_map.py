@@ -89,10 +89,14 @@ class TestUnsolvedMapFrontend(unittest.TestCase):
         self.assertIn("aggregate counts only", html.lower())
         self.assertIn("escapeHTML", html, "rendered values must be escaped")
 
-    def test_public_page_has_no_external_dependencies(self):
+    def test_public_page_has_no_third_party_dependencies(self):
         html = MAP_PAGE.read_text(encoding="utf-8")
-        self.assertNotIn("<script src=", html)
         self.assertNotIn("cdn.", html)
+        # The only script the page loads is the site's own shared module: the escaper and the
+        # JSON reader live there now, one copy for the whole site (#3694 is what the copies
+        # cost). A page that kept its own copy would be the shape that broke the homepage.
+        self.assertIn('<script src="/js/site.js"></script>', html)
+        self.assertNotIn("function escapeHTML", html)
 
 
 @unittest.skipIf(shutil.which("node") is None, "node is not installed")

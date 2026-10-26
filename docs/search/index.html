@@ -296,6 +296,10 @@
 <!-- site-links:end --></footer>
 </div>
 
+<!-- The escaper and the JSON reader the site shares: one copy, loaded before this page's
+     script. `docs/js/site.js` is where they live now (they used to be copied into seven
+     pages, and the copies drifted — #3694 is what that cost). -->
+<script src="/js/site.js"></script>
 <script>
 const I18N = {
   en: {
@@ -478,16 +482,6 @@ function setLang(lang) {
   updateStats();
   const q = document.getElementById('q').value.trim();
   if (q) render(_lastResults, q);
-}
-
-function escapeHTML(value) {
-  return String(value || '').replace(/[&<>"']/g, ch => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;'
-  }[ch]));
 }
 
 function getLessonUrl(lesson) {
