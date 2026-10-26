@@ -171,18 +171,50 @@ jobs:
 
       - name: Comment the result on the PR
         if: github.event_name == 'pull_request' && steps.changed.outputs.any_changed == 'true'
-        continue-on-error: true
+        # No `continue-on-error` here, and no empty `catch`. Both were here from the first
+        # version of this file (PR #1768), and together they made this step unable to fail:
+        # `continue-on-error: true` swallowed a failed comment (a token without
+        # `pull-requests: write`, a rate limit, an API error) and turned it into a green run with
+        # no comment on the pull request, and the empty `catch` swallowed a failed *read* of the
+        # report and published "✅ Provenance gate passed" for a verdict nobody had established.
+        # That is the shape of `ci-lesson-search.yml` (measured 2026-10-26): a mechanism that
+        # can end green having produced nothing, with nothing to say it had failed.
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
+        env:
+          # The same two lists the checker steps work from. A pull request that only *deleted* a
+          # lesson has nothing to cite, so the checker steps are skipped and there is no report
+          # file to read. That is a verdict, not a failure — and it must not be mistaken for a
+          # checker that broke, which is why the distinction is read from the same outputs the
+          # checkers themselves are gated on.
+          ADDED_FILES: ${{ steps.classify.outputs.added }}
+          MODIFIED_FILES: ${{ steps.classify.outputs.modified }}
         with:
           script: |
             const fs = require('fs');
-            let report = '✅ **Provenance gate passed** — every cited source resolves.';
-            try {
-              const text = fs.readFileSync('provenance_report.txt', 'utf8');
-              if (text.includes('❌')) report = '❌ **Provenance gate failed.** See the report below.';
-              report += '\n\n```\n' + text.trim() + '\n```\n\n'
-                + 'Rules: [docs/maintainer/provenance-gate-2026-09-16.md](../blob/main/docs/maintainer/provenance-gate-2026-09-16.md)';
-            } catch (e) {}
+            const added = (process.env.ADDED_FILES || '').trim();
+            const modified = (process.env.MODIFIED_FILES || '').trim();
+            let report;
+            if (!added && !modified) {
+              report = 'ℹ️ **Provenance gate** — this pull request adds and modifies no lesson file, '
+                + 'so there was no cited source to check.';
+            } else {
+              try {
+                const text = fs.readFileSync('provenance_report.txt', 'utf8');
+                report = text.includes('❌')
+                  ? '❌ **Provenance gate failed.** See the report below.'
+                  : '✅ **Provenance gate passed** — every cited source resolves.';
+                report += '\n\n```\n' + text.trim() + '\n```\n\n'
+                  + 'Rules: [docs/maintainer/provenance-gate-2026-09-16.md](../blob/main/docs/maintainer/provenance-gate-2026-09-16.md)';
+              } catch (e) {
+                // The checker was supposed to write that file. Its absence means the verdict is
+                // *unknown*, and unknown is not "passed" — a green run is not evidence unless
+                // something in it can differ (#1984). So the step fails, and the pull request is
+                // told that the gate could not reach a verdict instead of being told it passed.
+                core.setFailed('the provenance report could not be read: ' + e.message);
+                report = '⚠️ **Provenance gate could not report a verdict** — the report file was '
+                  + 'missing, so whether the cited sources resolve is unknown.';
+              }
+            }
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
