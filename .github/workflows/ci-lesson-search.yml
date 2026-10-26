@@ -37,6 +37,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
+      # `actions: read` is the scope that lets this job read the *job logs* of the run that failed.
+      # Without it the read is refused, and the refusal used to be swallowed by an empty `catch`
+      # — so a failing matrix produced no signature, both downstream steps were skipped, and the
+      # workflow reported success. Measured 2026-10-26: every run of this path behaved that way
+      # (rerun attempt 2 of run 40271288490 reproduced it), and the token's own permission block
+      # printed `Contents: read / Metadata: read / PullRequests: write` with no `Actions` at all.
+      actions: read
       contents: read
       pull-requests: write
     steps:
@@ -63,11 +70,18 @@ jobs:
           # is the rule that keeps this shape out).
           MANUAL_ERROR: ${{ github.event.inputs.error || '' }}
           MANUAL_PR: ${{ github.event.inputs['pr-number'] || '' }}
+          # The trigger's verdict and its branch, as *workflow* expressions. They cannot be read
+          # inside the script body: `github.event` does not exist there (#1685), and an expression
+          # written inside a `script: |` is substituted by the engine before node sees it.
+          TRIGGER_CONCLUSION: ${{ github.event.workflow_run.conclusion || '' }}
+          TRIGGER_BRANCH: ${{ github.event.workflow_run.head_branch || '' }}
         with:
           script: |
             const run = context.payload.workflow_run || null;
             const manualError = (process.env.MANUAL_ERROR || '').trim();
             const manualPr = (process.env.MANUAL_PR || '').trim();
+            const triggerConclusion = (process.env.TRIGGER_CONCLUSION || '').trim();
+            const triggerBranch = (process.env.TRIGGER_BRANCH || '').trim();
 
             let prNumber = manualPr ? parseInt(manualPr, 10) : null;
             let runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
@@ -78,6 +92,11 @@ jobs:
             // a fork PR whenever someone dispatched this with a `pr-number`.
             let isSameRepo = 'false';
             let errorSignatures = [];
+            // A log we could not read is a fact, not a detail: "we were not allowed to look" and
+            // "there was nothing to report" have to be told apart, or the capability is blind and
+            // reports itself as silent (#1825, #1984).
+            let readFailures = [];
+            let jobsSeen = 0;
 
             if (manualError) {
               // The manual path does not scrape logs: the caller supplied the error text, which is the
@@ -91,8 +110,12 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 run_id: run.id,
-                filter: 'failed'
+                // `latest` and `all` are the only values this endpoint knows. `failed` — the value
+                // this used to pass — is not one of them, so the API ignored it and returned every
+                // job of every attempt. `latest` is the one that means "the attempt being judged".
+                filter: 'latest'
               });
+              jobsSeen = jobs.jobs.length;
 
               for (const job of jobs.jobs) {
                 try {
@@ -108,7 +131,10 @@ jobs:
                     .filter(l => /error|fail|exception|traceback/i.test(l))
                     .slice(-10));
                 } catch (e) {
-                  // Logs may not be available
+                  // Recorded, not swallowed: an empty `catch` here is what made this capability
+                  // look like it worked while reading nothing at all. The message says which job
+                  // and why, so the next reader does not have to guess.
+                  readFailures.push(`${job.name}: ${e.message}`);
                 }
               }
 
@@ -117,10 +143,48 @@ jobs:
               // same-repo failures may surface "novel intake" notes; fork PRs stay quiet
               const headRepo = (run.head_repository || {}).full_name || '';
               isSameRepo = headRepo === context.repo.full_name ? 'true' : 'false';
+
+              // The PR number is where the note goes — without it there is nowhere to put it, and
+              // the run would end as a search nobody sees. `workflow_run.pull_requests` is not
+              // populated in every payload shape, so the branch the run was made from is the
+              // fallback, and a branch that no longer has an open PR simply finds nothing.
+              if (prNumber === null && triggerBranch) {
+                try {
+                  const { data: found } = await github.rest.pulls.list({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    state: 'open',
+                    head: `${context.repo.owner}:${triggerBranch}`
+                  });
+                  if (found.length > 0) prNumber = found[0].number;
+                } catch (e) {
+                  readFailures.push(`PR lookup by branch ${triggerBranch}: ${e.message}`);
+                }
+              }
             } else {
               // A dispatch with no error text and no failing run to look at: say so, and let the steps
               // below no-op on an empty signature rather than inventing one.
               core.notice('Nothing to search: no error input and no failing Cross-Platform Tests run found.');
+            }
+
+            // What this run actually saw, before anything decides what happens next. A green run is
+            // not evidence unless something in it can differ (#1984), so the difference is written
+            // down where a reader will find it.
+            core.info(`ci-lesson-search: run=${runName} (${runUrl}) jobs=${jobsSeen} signatures=${errorSignatures.length} pr=${prNumber || 'none'} read-failures=${readFailures.length}`);
+            for (const failure of readFailures) {
+              core.info(`ci-lesson-search: could not read ${failure}`);
+            }
+
+            // A trigger that failed and a capability that read nothing is not "nothing to say" — it
+            // is a capability that cannot see. It says so, and the run goes red, because a green run
+            // here reads as "the CI failure was looked at and needed no lesson", which is the one
+            // thing that was never established.
+            if (triggerConclusion === 'failure' && errorSignatures.length === 0) {
+              if (readFailures.length > 0 || jobsSeen === 0) {
+                core.setFailed(`the triggering run failed, but no error text could be read from it (${jobsSeen} job(s), ${readFailures.length} read failure(s)) — this capability is blind, not silent`);
+              } else {
+                core.warning(`the triggering run failed and its logs were read, but they hold no error line — nothing to search, and no lesson was suggested`);
+              }
             }
 
             core.setOutput('pr_number', prNumber ? String(prNumber) : '');
