@@ -3,14 +3,14 @@
   "label": "onboarding",
   "message": "setup 185/wk · MCP 9.1k/day",
   "color": "blue",
-  "generated_at": "2026-10-26T15:30:53Z",
+  "generated_at": "2026-10-26T16:17:03Z",
   "window": {
     "downloads": "last-week",
     "activity": "2026-10-26",
     "traffic": "14d"
   },
   "downloads": {
-    "misakanet": 2340,
+    "misakanet": 1494,
     "misakanet-setup": 185
   },
   "activity": {
