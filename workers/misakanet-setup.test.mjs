@@ -121,6 +121,18 @@ function runOffline(home, ...flags) {
   });
 }
 
+/**
+ * Does the manifest mention this path, whichever separator the platform prints?
+ *
+ * The manifest prints the paths it would write, with the host's own separator: `~\.claude.json`
+ * on Windows, `~/.claude.json` elsewhere. An assertion shaped like POSIX therefore fails on
+ * Windows while the manifest is exactly right — measured 2026-10-26: the
+ * `MISAKANET_AGENT_DIR` test went red on all three Windows legs for that reason alone.
+ */
+function mentions(text, path) {
+  return text.replaceAll('\\', '/').includes(path);
+}
+
 function snapshot(dir) {
   const out = {};
   const walk = (p) => {
@@ -3326,11 +3338,25 @@ test('MISAKANET_AGENT_DIR moves the state directory the installer writes and --v
     // The hook already honours this variable; the installer must agree with it, or an install on
     // an unwritable HOME writes to one directory while --verify looks in another (#3701).
     // The manifest redacts the home prefix to `~`, so the override shows up as `~/writable-state`.
-    assert.ok(result.stdout.includes('~/writable-state/token'), result.stdout);
-    assert.ok(result.stdout.includes('~/writable-state/hook.mjs'), result.stdout);
-    assert.ok(!result.stdout.includes('~/.misakanet-agent'), result.stdout);
+    assert.ok(mentions(result.stdout, '~/writable-state/token'), result.stdout);
+    assert.ok(mentions(result.stdout, '~/writable-state/hook.mjs'), result.stdout);
+    assert.ok(!mentions(result.stdout, '~/.misakanet-agent'), result.stdout);
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('the manifest check reads a Windows-shaped path the same way', () => {
+  // The shape that went red on all three Windows legs (2026-10-26): the manifest prints the
+  // host's own separator, and the assertion must not care which one it is. Both shapes are
+  // checked here so the helper cannot go back to comparing POSIX text.
+  const rows = [
+    'tier1\t① 注册 MCP 端点\t~/writable-state/token\tcreate',      // POSIX
+    'tier1\t① 注册 MCP 端点\t~\\writable-state\\token\tcreate',    // Windows
+  ];
+  for (const row of rows) {
+    assert.ok(mentions(row, '~/writable-state/token'), row);
+    assert.ok(!mentions(row, '~/.misakanet-agent'), row);
   }
 });
 
