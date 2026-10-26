@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -57,6 +57,38 @@ test('announces itself on the first turn, then stays silent until the checkpoint
   }
   assert.match(runHook({ session_id: 's' }, 'prompt', env).stdout, /30/, 'must fire again at 30');
   assert.equal(JSON.parse(readFileSync(join(state, 's.json'), 'utf8')).turn, 30);
+});
+
+test('the hook still announces itself when it is started through a symlink', () => {
+  // macOS keeps every temporary directory under /var, which is a symlink to /private/var, and the
+  // packaged e2e installs the hook into such a directory. On 2026-10-26 all three macOS legs went
+  // red with `exit=0 stdout=""`: the hook ran and did nothing, because the entry-point guard
+  // compared the *resolved* module URL with the symlinked path and the two never matched.
+  //
+  // The shape is reproduced here on every platform, so the guard cannot go back to comparing the
+  // two strings: a hook that does nothing is a tool that looks installed and is not.
+  const root = mkdtempSync(join(tmpdir(), 'mn-symlink-'));
+  const real = join(root, 'real');
+  const link = join(root, 'link');
+  mkdirSync(real, { recursive: true });
+  // A *directory* link, not a file link: on Windows a file symlink needs elevation, a junction
+  // does not, and the mismatch the test is about lives in the directory part of the path.
+  symlinkSync(real, link, 'junction');
+  copyFileSync(HOOK, join(real, 'hook.mjs'));
+  try {
+    const state = mkdtempSync(join(tmpdir(), 'mn-hook-'));
+    const agentDir = mkdtempSync(join(tmpdir(), 'mn-agent-'));
+    const result = spawnSync(process.execPath, [join(link, 'hook.mjs'), 'prompt'], {
+      input: JSON.stringify({ session_id: 'symlinked' }),
+      encoding: 'utf8',
+      env: { ...process.env, MISAKANET_HOOK_STATE: state, MISAKANET_AGENT_DIR: agentDir },
+    });
+    assert.equal(result.status, 0, `hooks must never break the session: ${result.stderr}`);
+    assert.match(result.stdout, /已接入失败经验库/,
+      'a hook started through a symlink must still announce itself');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('sessions are counted independently', () => {
